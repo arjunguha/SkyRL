@@ -1095,7 +1095,17 @@ class PolicyWorkerBase(Worker):
                 entropy = masked_mean(entropy_BS, loss_mask)
 
             if self.cfg.algorithm.use_entropy_loss:
-                entropy_loss_term = entropy * self.cfg.algorithm.entropy_loss_coef
+                # entropy_loss_term is a pure BONUS (subtracted from `loss` below) with no
+                # ceiling of its own -- clamp entropy itself first so the bonus saturates past
+                # entropy_loss_cap instead of an unbounded gradient continuing to push entropy
+                # ever higher (see entropy_loss_cap's own docstring in config.py for the observed
+                # failure mode this guards against).
+                entropy_for_bonus = (
+                    torch.clamp(entropy, max=self.cfg.algorithm.entropy_loss_cap)
+                    if self.cfg.algorithm.entropy_loss_cap is not None
+                    else entropy
+                )
+                entropy_loss_term = entropy_for_bonus * self.cfg.algorithm.entropy_loss_coef
             else:
                 entropy_loss_term = torch.tensor(0.0)
 

@@ -151,6 +151,11 @@ class LossFnInputs(BaseModel):
     logprobs: TensorData
     values: TensorData = Field(default_factory=lambda: TensorData(data=[]))
     returns: TensorData = Field(default_factory=lambda: TensorData(data=[]))
+    # Per-token log probs of the SAME target_tokens under a frozen reference
+    # policy (e.g. the pre-RL base model). Empty by default -- only present
+    # when the client wants the standard GRPO/PPO KL-to-reference loss term
+    # (trainer.algorithm.use_kl_loss); see worker.py's `compute_approx_kl`.
+    base_action_log_probs: TensorData = Field(default_factory=lambda: TensorData(data=[]))
 
 
 class Datum(BaseModel):
@@ -304,6 +309,7 @@ class PreparedModelPassBatch(BaseModel):
     all_advantages: list[list[float]]
     all_values: list[list[float]]
     all_returns: list[list[float]]
+    all_base_action_log_probs: list[list[float]]
 
     # Per-example scalars
     all_model_ids: list[str]

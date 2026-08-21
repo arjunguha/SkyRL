@@ -119,6 +119,21 @@ class SkyRLTrainInferenceForwardingClient:
         model_input = sample_req.prompt.to_types()
         prompt_tokens = render_model_input([model_input])[0].prompt_ids
 
+        # AlgorithmConfig.use_base_model / agentic_harbor_trainer's KL-to-reference:
+        # a SamplingClient's compute_logprobs_async needs the PROMPT tokens' own
+        # logprobs (it hands the whole sequence in as "prompt", scoring it, and
+        # only cares about that -- the 1 forced completion token is discarded).
+        # vLLM's OpenAI-compatible /v1/completions only returns those via
+        # echo=True (which prepends the prompt tokens' own logprobs onto the
+        # response's token_logprobs, first entry always None -- no context to
+        # condition on). Bug fixed here: this forwarding client (the ONLY
+        # sampling path actually used when colocate_all=false, e.g. this
+        # project's run.sh) never requested or returned prompt_logprobs at all
+        # -- SampleOutput.prompt_logprobs was hardcoded None unconditionally,
+        # confirmed via a live crash chasing agentic_harbor_trainer's
+        # KL-to-reference use case.
+        want_prompt_logprobs = bool(getattr(sample_req, "prompt_logprobs", False))
+
         sp = sample_req.sampling_params
         payload = {
             "model": model_name,
@@ -183,6 +198,9 @@ class SkyRLTrainInferenceForwardingClient:
             tokens = choice.get("token_ids", [])
             lp = choice.get("logprobs") or {}
             logprobs = lp.get("token_logprobs") or []
+            # No echo=True here (see the native `prompt_logprobs` request param
+            # above) -- token_ids/token_logprobs on each choice are already
+            # completion-only, no prompt-token prefix to split off.
             # vLLM occasionally returns None for logprobs under load; zero-fill so
             # RL advantage computation doesn't see a ragged shape.
             if not logprobs and tokens:

@@ -136,6 +136,7 @@ def prepare_model_pass_batch(
     all_advantages = []
     all_values = []
     all_returns = []
+    all_base_action_log_probs = []
     all_loss_fns = []
     all_loss_fn_configs = []
     request_batch_slices = []
@@ -155,6 +156,7 @@ def prepare_model_pass_batch(
             all_advantages.append(loss_fn_inputs.advantages.data)
             all_values.append(loss_fn_inputs.values.data)
             all_returns.append(loss_fn_inputs.returns.data)
+            all_base_action_log_probs.append(loss_fn_inputs.base_action_log_probs.data)
             all_model_ids.append(model_id)
             all_loss_fns.append(request_data.loss_fn)
             all_loss_fn_configs.append(request_data.loss_fn_config)
@@ -169,6 +171,7 @@ def prepare_model_pass_batch(
         all_advantages=all_advantages,
         all_values=all_values,
         all_returns=all_returns,
+        all_base_action_log_probs=all_base_action_log_probs,
         all_model_ids=all_model_ids,
         all_loss_fns=all_loss_fns,
         all_loss_fn_configs=all_loss_fn_configs,

@@ -134,8 +134,16 @@ def _build_skyrl_train_config(
     cfg.trainer.critic.optimizer_config.scheduler = "constant_with_warmup"
     cfg.trainer.critic.optimizer_config.num_warmup_steps = 0
 
-    # TODO(tyler): Support KL Loss
-    cfg.trainer.algorithm.use_kl_loss = False
+    # KL Loss is now supported end-to-end (base_action_log_probs threaded through
+    # api.py/engine.py/this file, per agentic_harbor_trainer's use case) -- no
+    # longer force-disabled here. `use_cli_overrides` above already lets
+    # `--backend-config '{"trainer.algorithm.use_kl_loss": true, ...}'` set it;
+    # this used to unconditionally stomp that. Callers that don't pass
+    # base_action_log_probs on any datum are unaffected either way (see
+    # `has_base_action_log_probs` in `_to_training_batch`): with the field
+    # absent, `kl_loss` in worker.py would compute a KL against an all-zero
+    # base_action_log_probs tensor, which is why the KL loss is still gated on
+    # `use_kl_loss` explicitly rather than defaulting on.
 
     logger.info("SkyRL-Train config:\n%s", get_config_as_yaml_str(cfg))
     return cfg
@@ -224,6 +232,7 @@ class SkyRLTrainBackend(AbstractBackend):
             "all_advantages",
             "all_values",
             "all_returns",
+            "all_base_action_log_probs",
             "all_model_ids",
             "all_loss_fns",
             "all_loss_fn_configs",
@@ -672,14 +681,16 @@ class SkyRLTrainBackend(AbstractBackend):
         sequences, attention_masks, loss_masks, response_masks = [], [], [], []
         action_log_probs_list, advantages_list = [], []
         values_list, returns_list = [], []
+        base_action_log_probs_list = []
 
-        for seq, weights, logprobs, advs, values, returns in zip(
+        for seq, weights, logprobs, advs, values, returns, base_logprobs in zip(
             full_sequences,
             prepared_batch.all_token_weights,
             prepared_batch.all_sampling_logprobs,
             prepared_batch.all_advantages,
             prepared_batch.all_values,
             prepared_batch.all_returns,
+            prepared_batch.all_base_action_log_probs,
         ):
             pad_len = max_seq_len - len(seq)
             sequences.append([self._tokenizer.pad_token_id] * pad_len + list(seq))
@@ -691,6 +702,8 @@ class SkyRLTrainBackend(AbstractBackend):
             advantages_list.append([0.0] * action_pad + [float(a) for a in advs])
             values_list.append([0.0] * action_pad + [float(v) for v in values])
             returns_list.append([0.0] * action_pad + [float(r) for r in returns])
+            base_pad = max_response_len - len(base_logprobs)
+            base_action_log_probs_list.append([0.0] * base_pad + [float(lp) for lp in base_logprobs])
 
         sequences_tensor = torch.tensor(sequences, dtype=torch.long)
         attention_mask_tensor = torch.tensor(attention_masks, dtype=torch.long)
@@ -709,6 +722,7 @@ class SkyRLTrainBackend(AbstractBackend):
         has_advantages = any(len(a) > 0 for a in prepared_batch.all_advantages)
         has_values = any(len(v) > 0 for v in prepared_batch.all_values)
         has_returns = any(len(r) > 0 for r in prepared_batch.all_returns)
+        has_base_action_log_probs = any(len(lp) > 0 for lp in prepared_batch.all_base_action_log_probs)
         if has_logprobs:
             action_log_probs_tensor = torch.tensor(action_log_probs_list, dtype=torch.float32)
             batch_dict["action_log_probs"] = action_log_probs_tensor
@@ -722,6 +736,13 @@ class SkyRLTrainBackend(AbstractBackend):
             batch_dict["rollout_logprobs"] = action_log_probs_tensor
         if has_advantages:
             batch_dict["advantages"] = torch.tensor(advantages_list, dtype=torch.float32)
+        if has_base_action_log_probs:
+            # Per-token logprobs of the same target_tokens under a frozen reference
+            # policy -- feeds worker.py's compute_approx_kl when
+            # trainer.algorithm.use_kl_loss is on. Rows the client didn't supply
+            # this for come through as all-zero (see base_pad above); harmless
+            # since compute_approx_kl is masked by loss_mask anyway.
+            batch_dict["base_action_log_probs"] = torch.tensor(base_action_log_probs_list, dtype=torch.float32)
         if role == "critic":
             if has_values != has_returns:
                 raise ValueError("Critic batches must provide both values and returns, or neither")
@@ -798,6 +819,12 @@ class SkyRLTrainBackend(AbstractBackend):
             metrics["pg_loss:sum"] = float(data["policy_loss"])
         if "policy_entropy" in data:
             metrics["entropy_loss:sum"] = float(data["policy_entropy"])
+        if "policy_kl" in data:
+            # Only present when trainer.algorithm.use_kl_loss is on (worker.py
+            # only sets this key in that case) -- the actual KL-to-reference
+            # term this project's agentic_harbor_trainer relies on, previously
+            # computed but silently dropped here (not on this allowlist).
+            metrics["policy_kl:mean"] = float(data["policy_kl"])
         if "critic_loss" in data:
             metrics["critic_loss:sum"] = float(data["critic_loss"])
         if "values_mean" in data:
@@ -1003,7 +1030,24 @@ class SkyRLTrainBackend(AbstractBackend):
         )
         batch, pad_size = self._pad_batch(batch, micro_batch_size=micro_bs)
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
-        data = self._dispatch.forward(role, batch, model_id=model_id)
+        # Bug fixed here: loss_fn/loss_fn_config were never read off prepared_batch at all, so
+        # EVERY standalone (no-backward) /forward request silently took worker.py's loss_fn=None
+        # inference-only branch regardless of what the caller actually asked for -- confirmed via
+        # a live crash chasing agentic_harbor_trainer's use_base_model flag (loss_fn="cross_entropy",
+        # loss_fn_config={"use_base_model": 1.0}) landing here and never reaching
+        # _forward_micro_with_loss at all. Mirrors _forward_backward_single_model_batch's own
+        # extraction (minus its training-specific loss normalization, which doesn't apply to a
+        # no-backward call) -- "logprobs" is present in the loss_fn_outputs dict either way, so
+        # existing callers that rely on the inference-only branch's output shape are unaffected.
+        loss_fn = prepared_batch.all_loss_fns[0] if prepared_batch.all_loss_fns else None
+        if loss_fn is not None and len(set(prepared_batch.all_loss_fns)) > 1:
+            logger.warning(
+                "SkyRL backend received mixed loss functions %s in one forward-only batch; using '%s' for all",
+                set(prepared_batch.all_loss_fns),
+                loss_fn,
+            )
+        loss_fn_config = next((c for c in prepared_batch.all_loss_fn_configs if c is not None), None)
+        data = self._dispatch.forward(role, batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config, model_id=model_id)
 
         # Workers emit per-sample loss_fn_outputs directly. Trim padding entries.
         per_sample_outputs = data.loss_fn_outputs
@@ -1074,7 +1118,18 @@ class SkyRLTrainBackend(AbstractBackend):
         # mixes adapters in one batched sample call (the engine batches across
         # model_ids in find_batchable_sample); we route each request via the
         # `model` field in _sample_with_remote_client below.
-        unique_models = set(prepared_batch.all_model_ids)
+        #
+        # "" (empty string) is not an unregistered model_id to reject -- it's
+        # api.py's own sentinel for "plain base_model sampling, no LoRA at all"
+        # (asample: `if base_model: model_id = checkpoint_id = ""`), i.e. exactly
+        # what a client's `create_sampling_client(base_model=...)` sends. Bug
+        # fixed here: this validation previously rejected it as "unknown", so a
+        # pure base-model sampling request always failed -- confirmed via a live
+        # crash chasing agentic_harbor_trainer's KL-to-reference use case.
+        # _sample_with_remote_client's own per_request_models resolution already
+        # falls back to the plain (adapter-free) model name whenever a model_id
+        # isn't registered, so "" reaching that point is already handled correctly.
+        unique_models = {mid for mid in set(prepared_batch.all_model_ids) if mid}
         unknown = [mid for mid in unique_models if mid not in self._model_ids_to_role]
         if unknown:
             error = types.ErrorResponse(
@@ -1130,6 +1185,8 @@ class SkyRLTrainBackend(AbstractBackend):
                     "num_samples": 1,
                     "sampling_params": sampling_params.model_dump(),
                 }
+                if wants_prompt_logprobs[i]:
+                    json_body["include_prompt_logprobs"] = True
 
                 if i in prompt_logprobs_at:
                     json_body["include_prompt_logprobs"] = True

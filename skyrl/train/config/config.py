@@ -842,6 +842,18 @@ class AlgorithmConfig(BaseConfig):
     This encourages exploration by penalizing low-entropy (overly confident) policies."""
     entropy_loss_coef: float = 0.01
     """Coefficient for the entropy loss term. Only used when ``use_entropy_loss=True``."""
+    entropy_loss_cap: Optional[float] = None
+    """Clamp entropy (per-token, before entropy_loss_coef is applied) to at most this value before
+    computing the entropy bonus. None (default) = uncapped.
+
+    entropy_loss_term is a pure BONUS (subtracted from the loss, see worker.py's RL path) with no
+    target/ceiling of its own -- its gradient always pushes toward MORE entropy, with nothing
+    pulling back once entropy is already high. Observed in practice (agentic_harbor_trainer's
+    tvgpo_full_20260819_222829 run): a slow, accelerating entropy climb over ~40 steps, invisible
+    at first, that eventually produced genuinely incoherent generations (see that run's
+    debug_logs/entropy_collapse_debug.md). Once entropy exceeds entropy_loss_cap, the bonus
+    saturates -- still rewards exploration up to the cap, but the runaway positive-feedback
+    gradient beyond it is removed."""
     temperature: Optional[float] = None
     """Temperature for scaling logits in policy loss computation.
     If ``None``, will be set to the temperature provided by ``generator.sampling_params.temperature`` during config validation.
