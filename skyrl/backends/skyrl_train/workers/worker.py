@@ -907,6 +907,19 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
 
+        # KL's per-token normalization denominator: total valid (loss_mask) tokens across
+        # this rank's WHOLE local batch, computed once up front -- see kl_loss's own
+        # normalization comment in _forward_backward_micro for why this needs to be a
+        # global-token-count divisor rather than reusing `microbatch_weight` (a
+        # sequence-count ratio). With micro_train_batch_size_per_gpu=1 (this project's
+        # config), every microbatch is exactly one sequence, so microbatch_weight gives
+        # every sequence equal weight regardless of its own length -- confirmed via a live
+        # run where variable-length multi-turn trajectories let the KL anchor's effective
+        # strength drift with whatever length mix landed in a given step, unlike
+        # policy_loss (whose advantages are already pre-divided client-side by the true
+        # global token count, so longer sequences correctly contribute more).
+        total_valid_tokens = data["loss_mask"].sum().clamp(min=1)
+
         for microbatch in microbatch_iterator:
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
@@ -916,6 +929,7 @@ class PolicyWorkerBase(Worker):
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
                 return_per_token_outputs=return_per_token_outputs,
+                kl_norm_denominator=total_valid_tokens,
             )
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
@@ -950,6 +964,7 @@ class PolicyWorkerBase(Worker):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        kl_norm_denominator: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -963,6 +978,11 @@ class PolicyWorkerBase(Worker):
             loss_fn_config: Optional config overrides for the resolved train loss function.
             return_per_token_outputs: When False, skip building per-token
                 ``loss_fn_outputs`` when callers read only ``metrics``.
+            kl_norm_denominator: Total valid tokens across the whole rank-local batch
+                (computed once in `forward_backward`). Normalizes the KL term as a true
+                per-token mean over the whole batch, matching policy_loss's own
+                (pre-divided, client-side) global-token-count convention, instead of a
+                per-sequence mean weighted equally regardless of sequence length.
 
         Returns:
             Metrics dict for the worker's local micro batch
@@ -1111,15 +1131,33 @@ class PolicyWorkerBase(Worker):
 
             # kl loss
             if self.cfg.algorithm.use_kl_loss:
-                kl_loss = compute_approx_kl(
+                kl_loss_per_token = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
                     loss_mask=loss_mask,
                     kl_estimator_type=self.cfg.algorithm.kl_estimator_type,
                 )
-                kl_loss = masked_mean(kl_loss, loss_mask, dim=-1).mean()
+                # Reported metric (status["policy_kl"] below): the original per-sequence-
+                # then-batch mean, unchanged -- kept on its old scale/semantics so it
+                # stays comparable to every KL value logged before this fix, independent
+                # of how the actual loss term below is normalized.
+                kl_loss_for_metric = masked_mean(kl_loss_per_token, loss_mask, dim=-1).mean()
+                # Loss term: per-token mean over the WHOLE rank-local batch
+                # (kl_norm_denominator), not the per-sequence-then-batch mean above --
+                # that reduces per-sequence first, then averages sequences equally
+                # regardless of length. With micro_train_batch_size_per_gpu=1 (this
+                # project's config), each microbatch here is exactly one sequence, so
+                # this microbatch's sum of per-token KL divided by the GLOBAL token count
+                # gives that sequence its correct, length-proportional share -- matching
+                # how policy_loss's advantages are already pre-divided client-side by the
+                # same global count. See forward_backward's kl_norm_denominator comment
+                # for why the old per-sequence-equal-weight version let the KL anchor's
+                # effective strength drift with each step's trajectory-length mix.
+                assert kl_norm_denominator is not None, "kl_norm_denominator required when use_kl_loss is set"
+                kl_loss = (kl_loss_per_token * loss_mask).sum() / kl_norm_denominator
             else:
                 kl_loss = torch.tensor(0.0)
+                kl_loss_for_metric = torch.tensor(0.0)
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
 
             # DP all-reduce averages gradients, but policy losses are pre-scaled sums
@@ -1127,9 +1165,16 @@ class PolicyWorkerBase(Worker):
             # dp_size to recover the correct sum reduction across workers.
             grad_sum_correction_factor = self.mesh_rank.dp_size
 
-            # NOTE: The KL and entropy loss terms are not pre-scaled,
-            # so we just average them across microbatches and DP workers.
-            loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
+            # NOTE: entropy_loss_term is not pre-scaled, so it's still weighted by
+            # microbatch_weight (a sequence-count ratio) and averaged across DP workers --
+            # unaffected by this fix (use_entropy_loss is off in every run using KL so far).
+            # kl_loss_term, unlike entropy, IS now pre-scaled (see its own comment above):
+            # each microbatch already carries its correct per-token share of the whole
+            # rank-local batch via kl_norm_denominator, so accumulating it plainly across
+            # microbatches (no microbatch_weight) and letting DP average it naturally
+            # (no grad_sum_correction_factor -- unlike policy_loss, we WANT a true mean
+            # here, not a recomposed sum) gives the correct global per-token-mean KL.
+            loss = policy_loss * grad_sum_correction_factor + kl_loss_term - entropy_loss_term * microbatch_weight
             unscaled_loss = loss / grad_sum_correction_factor
             self.strategy.backward(loss, self.model, self.optimizer)
 
@@ -1164,7 +1209,7 @@ class PolicyWorkerBase(Worker):
             for k, v in loss_metrics.items():
                 status["loss_metrics/" + k] = v
             if self.cfg.algorithm.use_kl_loss:
-                status["policy_kl"] = kl_loss.item()
+                status["policy_kl"] = kl_loss_for_metric.item()
             status.update(
                 compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
             )
