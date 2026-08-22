@@ -24,6 +24,7 @@ from skyrl.env_vars import (
     SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
     SKYRL_LD_LIBRARY_PATH_EXPORT,
     SKYRL_PYTHONPATH_EXPORT,
+    SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES,
     SKYRL_RAY_PG_TIMEOUT_IN_S,
 )
 from skyrl.train.config.config import SkyRLTrainConfig
@@ -913,7 +914,17 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    #
+    # object_store_memory: explicitly capped (see SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES's own
+    # docstring) -- this call previously passed no cap at all, so Ray fell back to sizing
+    # against ~30% of the WHOLE machine's memory (capped at 200GiB), with zero awareness of
+    # other users' concurrent Ray clusters on a shared host. Confirmed as a real, unbounded
+    # risk after a shared-host OOM reset traced back to this having no memory limit anywhere
+    # in the training path. 0 restores the old unbounded-default behavior.
+    ray_init_kwargs = {"runtime_env": {"env_vars": env_vars}, "log_to_driver": True}
+    if SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES:
+        ray_init_kwargs["object_store_memory"] = SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES
+    ray.init(**ray_init_kwargs)
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")
@@ -1086,8 +1097,17 @@ def peer_access_supported(max_num_gpus_per_node: int):
         return False
 
     if not torch.cuda.is_available():
-        # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
-        ray.init()
+        # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs.
+        # Same object_store_memory cap as initialize_ray() above -- see
+        # SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES's docstring for why an uncapped ray.init()
+        # is a real shared-host OOM risk.
+        ray.init(
+            **(
+                {"object_store_memory": SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES}
+                if SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES
+                else {}
+            )
+        )
         pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
         get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
         result = ray.get(
