@@ -110,6 +110,11 @@ def _build_skyrl_train_config(
         user_overrides.setdefault("trainer.critic.model.path", base_model)
     else:
         user_overrides["trainer.critic.model.path"] = base_model
+    # RefConfig.model.path has no working default (see its own TODO in config.py --
+    # docstring claims it defaults to the policy path, but nothing actually wires
+    # that up), so set it explicitly here, mirroring critic above. Only used when
+    # a "ref" role model is actually created (trainer.algorithm.use_kl_loss).
+    user_overrides["trainer.ref.model.path"] = base_model
     # Strategy must be set on the override dict (not after from_cli_overrides) so
     # TrainerConfig.__post_init__ sees the right value during validation —
     # e.g. logprobs_chunk_size=None is only valid when strategy=megatron.
@@ -166,6 +171,14 @@ class SkyRLTrainBackend(AbstractBackend):
         self._cfg = None
         self._dispatch: WorkerDispatch | None = None
         self._colocate_pg: ResolvedPlacementGroup | None = None
+        # Placement group shared by the policy and ref actor groups when
+        # trainer.placement.colocate_policy_ref is on and a ref model is
+        # actually requested (trainer.algorithm.use_kl_loss/use_kl_in_reward).
+        # Built in _build_policy (before policy claims its GPU(s)) so _build_ref
+        # can later land on the SAME physical GPU(s) -- see _build_policy's
+        # docstring-adjacent comment for why this can't be done the other way
+        # around. None whenever ref colocation isn't in play.
+        self._policy_ref_pg: ResolvedPlacementGroup | None = None
         self._tokenizer: AutoTokenizer = get_tokenizer(self.base_model)
         self._inference_engine_client = None
         self._inference_engines_initialized = False
@@ -284,13 +297,52 @@ class SkyRLTrainBackend(AbstractBackend):
                 num_policy_gpus == num_rollout_gpus
             ), "num_policy_gpus and num_rollout_gpus must be the same when colocating all models"
 
+        # Reserve a placement group shared with the (not-yet-built) ref model when
+        # trainer.algorithm.use_kl_loss/use_kl_in_reward wants one and
+        # colocate_policy_ref is on -- mirrors native SkyRL's trainer.py
+        # build_models(), which builds policy+ref together against one shared pg.
+        # Must happen HERE, before policy's own GPU request below: Ray has no way
+        # to retroactively colocate a new actor onto a GPU some other actor already
+        # claimed non-fractionally, so a later _build_ref() call (after policy
+        # already grabbed a full GPU) could not land on the same device.
+        use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+        if not colocate_all and cfg.trainer.placement.colocate_policy_ref and use_ref_model:
+            assert (
+                cfg.trainer.placement.policy_num_nodes == cfg.trainer.placement.ref_num_nodes
+                and cfg.trainer.placement.policy_num_gpus_per_node == cfg.trainer.placement.ref_num_gpus_per_node
+            ), "policy/ref num_nodes and num_gpus_per_node must match to colocate them"
+            bundles = [
+                {
+                    "GPU": cfg.trainer.placement.policy_num_gpus_per_node,
+                    "CPU": cfg.trainer.placement.policy_num_gpus_per_node,
+                }
+                for _ in range(cfg.trainer.placement.policy_num_nodes)
+            ]
+            raw_pg = placement_group(bundles, strategy="PACK")
+            get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+            self._policy_ref_pg = ResolvedPlacementGroup(raw_pg)
+
+        policy_pg = pg if colocate_all else self._policy_ref_pg
+        policy_num_gpus_per_actor = 0.2 if colocate_all else (0.75 if policy_pg else 1)
+
         policy_model = PPORayActorGroup(
             cfg.trainer,
             cfg.trainer.placement.policy_num_nodes,
             cfg.trainer.placement.policy_num_gpus_per_node,
             PolicyWorker,
-            pg=pg,
-            num_gpus_per_actor=0.2 if colocate_all else (getattr(self.config, "policy_gpu_fraction", None) or 1),
+            # pg=policy_pg (not the bare colocate_all pg above): respects ref-model
+            # colocation (lines above) when that's what's actually configured.
+            # num_gpus_per_actor: policy_gpu_fraction (ppo_critic's GPU split)
+            # takes priority when set and not colocating everything; otherwise
+            # fall back to policy_num_gpus_per_actor (0.2 under colocate_all,
+            # else ref-colocation-aware) -- the two features are mutually
+            # exclusive in practice (critic vs. KL-ref) but each needs its own
+            # case honored here regardless of the other.
+            pg=policy_pg,
+            num_gpus_per_actor=(
+                (not colocate_all and getattr(self.config, "policy_gpu_fraction", None))
+                or policy_num_gpus_per_actor
+            ),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
             record_memory=cfg.trainer.policy.record_memory,
@@ -362,6 +414,53 @@ class SkyRLTrainBackend(AbstractBackend):
             critic_model.offload_to_cpu()
             self._dispatch.mark_as_offloaded("critic")
         logger.info("init critic model done")
+
+    def _build_ref(self, RefWorker) -> None:
+        """Build a genuinely separate, statically-loaded (once) reference model.
+
+        Matches native SkyRL's own ref_model exactly (see trainer.py's
+        build_models): a real second PPORayActorGroup, no LoRA adapter of any
+        kind, GPU-shared with the policy via _policy_ref_pg (reserved back in
+        _build_policy) when trainer.placement.colocate_policy_ref is on --
+        never touches vLLM/inference serving. Reference logprobs come from a
+        direct forward pass (see RefWorkerBase.forward in worker.py), not from
+        any sampling client.
+        """
+        cfg = self._cfg
+        colocate_all = cfg.trainer.placement.colocate_all
+        if colocate_all:
+            pg = self._colocate_pg
+            num_gpus_per_actor = 0.2
+        else:
+            pg = self._policy_ref_pg
+            num_gpus_per_actor = 0.25 if pg else 1
+        ref_model = PPORayActorGroup(
+            cfg.trainer,
+            cfg.trainer.placement.ref_num_nodes,
+            cfg.trainer.placement.ref_num_gpus_per_node,
+            RefWorker,
+            pg=pg,
+            num_gpus_per_actor=num_gpus_per_actor,
+            colocate_all=colocate_all,
+            sequence_parallel_size=cfg.trainer.ref.sequence_parallel_size,
+        )
+        self._dispatch.register_actor_group("ref", ref_model)
+        # No num_training_steps: FSDPRefWorkerBase.init_model(model_path) takes no
+        # such kwarg at all (ref never trains, so there's no scheduler to size --
+        # unlike policy/critic's init_model, which does accept it). Matches native
+        # SkyRL's own trainer.py build_models(), which calls
+        # ref_model.async_init_model(cfg.trainer.ref.model.path) with no second arg.
+        self._dispatch.init_model("ref", cfg.trainer.ref.model.path)
+        # No _set_pad_token_id call here (unlike policy/critic): RefWorkerBase
+        # doesn't implement it at all -- confirmed via a live crash
+        # (AttributeError: 'ActorHandle' object has no attribute
+        # '_set_pad_token_id') -- and native SkyRL's own trainer.py
+        # build_models() never calls it on ref_model either; ref never trains
+        # or generates, so there's nothing that needs the pad token id set.
+        if colocate_all:
+            ref_model.offload_to_cpu()
+            self._dispatch.mark_as_offloaded("ref")
+        logger.info(f"init ref model done (colocated_with_policy={pg is not None})")
 
     def init_weight_sync_state(self):
         """
@@ -557,6 +656,24 @@ class SkyRLTrainBackend(AbstractBackend):
             else:
                 raise ValueError(f"Unknown strategy type: {self._cfg.trainer.strategy}")
             self._build_critic(CriticWorker, lora_config)
+        elif model_role == "ref":
+            if model_role in self._model_ids_to_role.values():
+                raise ValueError(f"SkyRLTrainBackend already has a '{model_role}' model")
+            if "policy" not in self._model_ids_to_role.values():
+                raise ValueError("Create a policy model before creating a ref model")
+            if self._cfg.trainer.strategy == "fsdp":
+                from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
+                    RefWorker,
+                )
+            elif self._cfg.trainer.strategy == "megatron":
+                raise NotImplementedError("Ref model support is not implemented for the Megatron backend yet")
+            else:
+                raise ValueError(f"Unknown strategy type: {self._cfg.trainer.strategy}")
+            # Ref is never LoRA -- it IS the frozen base model, no adapter of any
+            # kind (this is the whole point vs. the sampling-client approach's
+            # base-model-served-by-the-same-vLLM-engine workaround). lora_config
+            # is accepted (CreateModelInput requires one) but intentionally unused.
+            self._build_ref(RefWorker)
         else:
             raise ValueError(f"Unknown model_role: {model_role}")
 
@@ -1047,6 +1164,22 @@ class SkyRLTrainBackend(AbstractBackend):
                 loss_fn,
             )
         loss_fn_config = next((c for c in prepared_batch.all_loss_fn_configs if c is not None), None)
+        if role == "ref":
+            # RefWorkerBase.forward(data) (worker.py) takes no loss_fn at all -- it
+            # always runs the loss-free, logprobs-only inference path (matching
+            # native SkyRL's own trainer.py, which calls dispatch.forward("ref", ...)
+            # the same way with no loss_fn). The wire protocol still requires the
+            # client to send *some* loss_fn on every Datum (ForwardBackwardInput.loss_fn
+            # is a required field) -- silently drop it here instead of forwarding it
+            # into a forward() signature that doesn't accept it.
+            loss_fn, loss_fn_config = None, None
+            # Also drop model_id: ref is never LoRA (no AdapterStore at all,
+            # unlike policy/critic) -- WorkerDispatch.ensure_active_adapter
+            # unconditionally calls swap_to_adapter whenever model_id is not
+            # None, which crashed here with AttributeError: 'ActorHandle'
+            # object has no attribute 'swap_to_adapter' (confirmed via a live
+            # crash) since RefWorkerBase implements no such method.
+            model_id = None
         data = self._dispatch.forward(role, batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config, model_id=model_id)
 
         # Workers emit per-sample loss_fn_outputs directly. Trim padding entries.
