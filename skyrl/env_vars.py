@@ -15,6 +15,26 @@ SKYRL_RAY_PG_TIMEOUT_IN_S = int(os.environ.get("SKYRL_RAY_PG_TIMEOUT_IN_S", 180)
 Timeout for allocating the placement group for different actors in SkyRL.
 """
 
+SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES = int(
+    os.environ.get("SKYRL_RAY_OBJECT_STORE_MEMORY_BYTES", 16 * 1024**3)
+)
+"""
+Explicit cap on Ray's plasma object store size, in bytes (default 16GiB).
+
+initialize_ray()'s `ray.init()` call previously passed no `object_store_memory`
+at all, so Ray fell back to its own default sizing: ~30% of the machine's
+*total* memory, capped at 200GiB -- on a large shared host, that is a huge,
+uncoordinated reservation with zero awareness of other users' concurrent Ray
+clusters (each independent `ray.init()` sizes against the whole machine, not
+a fair share of it). Confirmed as a real, unbounded risk after a shared-host
+OOM reset traced back to this box's training jobs never having set any
+memory limit at all. This RL workload's actual object-store footprint is
+small (batched tokens/logprobs/small tensors; the big data -- model
+weights/activations -- lives in GPU memory managed by FSDP, not Ray's plasma
+store), so 16GiB is a generous cap, not a tight one. Set explicitly to 0 to
+restore the old unbounded-default behavior.
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker / NCCL
 # ─────────────────────────────────────────────────────────────────────────────
