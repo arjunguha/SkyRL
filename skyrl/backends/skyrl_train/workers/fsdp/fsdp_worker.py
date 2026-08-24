@@ -355,6 +355,31 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             torch.cuda.empty_cache()
         torch.distributed.barrier()
 
+        # inference_engine_client arrives here via PassThroughDispatch.dispatch
+        # (distributed/dispatch.py), which calls actor.method.remote(*args) with
+        # the raw client object -- no ray.put(), no caching. Every call this
+        # actor receives is therefore a FRESH deserialized copy: RemoteInferenceClient
+        # .__setstate__ resets _session=None on every unpickle (by design -- an
+        # aiohttp session can't survive serialization), so whatever HTTP session
+        # THIS call's copy created above (load_lora_adapter/reset_prefix_cache)
+        # is only reachable through this local variable. Once this coroutine
+        # returns, the argument goes out of scope and that live session --
+        # sockets, TCP connector pool and all -- becomes unreachable garbage
+        # with nothing having ever called .close() on it. That leaked once per
+        # weight sync (i.e. once per training step) is a genuine, unbounded-
+        # over-a-run host-memory leak, confirmed live: "Unclosed client
+        # session"/"Unclosed connector" warnings appearing exactly once per
+        # sync_weights call in a real run's worker log, and anon RSS climbing
+        # roughly linearly with step count. getattr+truthy rather than
+        # isinstance(..., RemoteInferenceClient): that class is only imported
+        # locally inside _save_lora_adapters_and_sync above, and duck-typing
+        # here is safe -- teardown() itself already no-ops when there's no
+        # session to close (e.g. every non-rank-0 worker, which never actually
+        # touches inference_engine_client above at all).
+        teardown = getattr(inference_engine_client, "teardown", None)
+        if teardown is not None:
+            await teardown()
+
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
         self.model.model.config.pad_token_id = pad_token_id
