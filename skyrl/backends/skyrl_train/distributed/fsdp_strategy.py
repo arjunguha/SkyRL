@@ -358,6 +358,68 @@ class FSDPStrategy(DistributedStrategy):
 
         dist.barrier()
 
+    @staticmethod
+    def _restore_lora_adapter_name(state_dict, adapter_name="default", parameter_prefix="lora_"):
+        """Undo the adapter-name stripping that peft's get_peft_model_state_dict applies.
+
+        get_peft_model_state_dict (used by layered_summon_lora_params to build the file
+        _load_lora_adapters reads) removes the adapter name from each key, e.g.
+        "...lora_A.default.weight" -> "...lora_A.weight" -- see its docstring. The live
+        model's actual parameter names still include it, so this must be undone before
+        handing the state dict to set_model_state_dict below; otherwise every key looks
+        "unexpected" and strict=False silently drops all of them instead of raising.
+
+        Inlined (rather than imported) from peft.utils.save_and_load's private
+        `_insert_adapter_name_into_state_dict` (peft==0.18.1) so this doesn't depend on
+        an underscore-prefixed internal of a third-party package.
+        """
+        import re
+
+        restored = {}
+        for key, val in state_dict.items():
+            if parameter_prefix in key:
+                _, _, suffix = key.rpartition(parameter_prefix)
+                if "." in suffix:
+                    suffix_to_replace = ".".join(suffix.split(".")[1:])
+                    key = re.sub(re.escape(suffix_to_replace) + r"$", f"{adapter_name}.{suffix_to_replace}", key)
+                else:
+                    key = f"{key}.{adapter_name}"
+            restored[key] = val
+        return restored
+
+    def _load_lora_adapters(self, model, ckpt_dir):
+        """Load LoRA adapters saved by _save_lora_adapters back into the model.
+
+        Counterpart to the save-side skip in save_checkpoint: since only the
+        adapter is persisted for LoRA runs, this is the only piece that needs
+        restoring here -- the frozen base weights are already in place from
+        the initial from-pretrained load and never change during training.
+        """
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            set_model_state_dict,
+        )
+
+        lora_load_path = os.path.join(ckpt_dir, "lora_adapter", "adapter_model.safetensors")
+
+        full_sd = {}
+        with io.local_read_dir(ckpt_dir) as read_dir:
+            adapter_path = os.path.join(read_dir, "lora_adapter", "adapter_model.safetensors")
+            if not io.exists(adapter_path):
+                raise FileNotFoundError(f"LoRA adapter checkpoint not found: {lora_load_path}")
+            if self.is_rank_0():
+                full_sd = self._restore_lora_adapter_name(load_file(adapter_path))
+
+        # strict=False: full_sd only covers the lora_ params, not the frozen base
+        # model, so the rest of the model's keys are expected to be "missing" here.
+        set_model_state_dict(
+            model,
+            full_sd,
+            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, strict=False),
+        )
+        dist.barrier()
+
     def save_checkpoint(
         self,
         model,
@@ -384,6 +446,13 @@ class FSDPStrategy(DistributedStrategy):
         else:
             save_model = model
 
+        # Same condition as the _save_lora_adapters call below: only treat this as a
+        # LoRA checkpoint (and skip the full model dump) if the live model is actually
+        # PEFT-wrapped. Guards against self.is_lora=True (from model_config) but the
+        # model somehow not being PEFT-wrapped -- falling back to the full save in that
+        # case instead of silently saving no model weights at all.
+        is_lora_checkpoint = self.is_lora and hasattr(save_model, "peft_config")
+
         # Define paths for saving individual rank files
         rank = self.get_rank()
         world_size = self.world_size
@@ -396,10 +465,19 @@ class FSDPStrategy(DistributedStrategy):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 # FSDP2 state_dict returns DTensors directly; no state_dict_type context needed.
-                model_state_dict = save_model.state_dict()
-                self.print(f"[rank-{rank}]: Saving model to {model_path}")
-                with io.open_file(model_path, "wb") as f:
-                    torch.save(model_state_dict, f)
+                # For LoRA runs, skip materializing/saving the full (frozen) base model
+                # weights here: they never change during training, so the copy already
+                # loaded from the base model path at construction time is identical to
+                # what this dump would contain. _save_lora_adapters below already saves
+                # the only part that actually changed (the adapter, in bf16 safetensors).
+                # Writing the full state_dict too costs ~100x the useful bytes (full
+                # fp32 base model vs. the adapter) for no benefit -- see load_checkpoint's
+                # LoRA branch for the corresponding skip on the read side.
+                if not is_lora_checkpoint:
+                    model_state_dict = save_model.state_dict()
+                    self.print(f"[rank-{rank}]: Saving model to {model_path}")
+                    with io.open_file(model_path, "wb") as f:
+                        torch.save(model_state_dict, f)
 
                 # Get and save optimizer state dict if optimizer is provided
                 optimizer_state_dict = {}
@@ -444,7 +522,7 @@ class FSDPStrategy(DistributedStrategy):
                     json.dump({"fsdp_strategy": self.fsdp_strategy, "world_size": self.world_size}, f, indent=4)
 
         # Save LoRA adapters if using LoRA
-        if self.is_lora and hasattr(save_model, "peft_config"):
+        if is_lora_checkpoint:
             self._save_lora_adapters(save_model, ckpt_dir)
 
         # Final barrier to ensure all operations complete
@@ -476,6 +554,12 @@ class FSDPStrategy(DistributedStrategy):
         if isinstance(model, HFModelWrapper):
             load_model = model.model
 
+        # Same condition as save_checkpoint's is_lora_checkpoint: only treat this as a
+        # LoRA checkpoint (and skip requiring/loading the full model dump) if the live
+        # model is actually PEFT-wrapped, matching what save_checkpoint would have done
+        # for this same model.
+        is_lora_checkpoint = self.is_lora and hasattr(load_model, "peft_config")
+
         # Define paths for loading individual rank files
         rank = self.get_rank()
         world_size = self.world_size
@@ -488,8 +572,11 @@ class FSDPStrategy(DistributedStrategy):
             optim_path = os.path.join(read_dir, optim_file)
             extra_path = os.path.join(read_dir, extra_file)
 
-            # Check if checkpoint files exist
-            if not io.exists(model_path):
+            # LoRA checkpoints (see save_checkpoint) don't write model_world_size_*.pt at
+            # all -- the frozen base weights are already correct from construction, and
+            # the adapter is restored separately below via _load_lora_adapters. Only
+            # require it for full-param runs.
+            if not is_lora_checkpoint and not io.exists(model_path):
                 raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
             if not io.exists(extra_path):
                 raise FileNotFoundError(f"Extra state checkpoint not found: {extra_path}")
@@ -497,14 +584,16 @@ class FSDPStrategy(DistributedStrategy):
             # Optimizer path is optional since we may not save optimizer states initially
             optim_exists = io.exists(optim_path)
 
-            self.print(f"[rank-{rank}]: Loading model from {model_path}")
             self.print(f"[rank-{rank}]: Loading extra_state from {extra_path}")
             if optim_exists:
                 self.print(f"[rank-{rank}]: Loading optim from {optim_path}")
 
             # Load state dictionaries from disk
-            with io.open_file(model_path, "rb") as f:
-                model_state_dict = torch.load(f, map_location="cpu", weights_only=False)
+            model_state_dict = None
+            if not is_lora_checkpoint:
+                self.print(f"[rank-{rank}]: Loading model from {model_path}")
+                with io.open_file(model_path, "rb") as f:
+                    model_state_dict = torch.load(f, map_location="cpu", weights_only=False)
             with io.open_file(extra_path, "rb") as f:
                 extra_state_dict = torch.load(f, map_location="cpu", weights_only=False)
 
@@ -518,9 +607,13 @@ class FSDPStrategy(DistributedStrategy):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # FSDP2: load_state_dict accepts DTensors directly; no state_dict_type context needed.
-            load_model.load_state_dict(model_state_dict, strict=load_module_strict)
-            self.print(f"[rank-{rank}]: Successfully loaded model state dict")
+            if is_lora_checkpoint:
+                self._load_lora_adapters(load_model, ckpt_dir)
+                self.print(f"[rank-{rank}]: Successfully loaded LoRA adapter")
+            else:
+                # FSDP2: load_state_dict accepts DTensors directly; no state_dict_type context needed.
+                load_model.load_state_dict(model_state_dict, strict=load_module_strict)
+                self.print(f"[rank-{rank}]: Successfully loaded model state dict")
 
             # Load optimizer state dict if optimizer object is provided and loading is requested
             if optimizer is not None and load_optimizer_states and optimizer_state_dict:

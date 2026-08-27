@@ -702,11 +702,20 @@ class TinkerEngine:
             sampling_session_id=request_data.sampling_session_id,
         )
 
-    def _complete_futures(self, results: dict[str, BaseModel]):
+    def _complete_futures(self, results: dict[str, BaseModel], clear_request_data: bool = False):
         """Helper method to complete multiple futures in the database.
 
         Args:
             results: Dict mapping request_id to result (Pydantic BaseModel)
+            clear_request_data: If True, null out the persisted request_data for these
+                futures once they complete. request_data is only ever read back for
+                PENDING futures (see find_batchable_model_passes/find_batchable_sample),
+                so it's dead weight after completion. Forward/forward_backward requests
+                carry the full per-token training batch (tokens, weights, advantages,
+                logprobs, values, returns) and are the dominant contributor to
+                tinker.db's steady per-step growth, so this is scoped to those callers
+                rather than applied unconditionally (e.g. sample requests are cheap and
+                some tests inspect their persisted request_data after completion).
         """
         completed_at = datetime.now(timezone.utc)
         params = [
@@ -720,6 +729,7 @@ class TinkerEngine:
                 "result_data": result.model_dump_json(),
                 "status": RequestStatus.FAILED if isinstance(result, types.ErrorResponse) else RequestStatus.COMPLETED,
                 "completed_at": completed_at,
+                **({"request_data": {}} if clear_request_data else {}),
             }
             for request_id, result in results.items()
         ]
@@ -772,6 +782,7 @@ class TinkerEngine:
         processor: Callable[[dict[str, tuple[str, BaseModel]]], dict[str, BaseModel]],
         name: str,
         per_model: bool = False,
+        clear_request_data: bool = False,
     ):
         """Process a batch of requests with error handling and future completion.
 
@@ -783,12 +794,13 @@ class TinkerEngine:
                 model's futures as soon as its sub-batch finishes (GPU execution
                 is serialized per model anyway; this only changes completion
                 granularity, not batching within a model).
+            clear_request_data: Passed through to _complete_futures; see its docstring.
         """
         if not requests:
             return
         error_results, valid_requests = self._filter_valid_requests(requests)
         if error_results:
-            self._complete_futures(error_results)
+            self._complete_futures(error_results, clear_request_data=clear_request_data)
         if per_model:
             grouped: dict[str, dict] = defaultdict(dict)
             for request_id, item in valid_requests.items():
@@ -803,7 +815,7 @@ class TinkerEngine:
                 except Exception as e:
                     logger.exception(f"Error processing batch: {e}")
                     results = {request_id: types.ErrorResponse(error=str(e), status="failed") for request_id in group}
-            self._complete_futures(results)
+            self._complete_futures(results, clear_request_data=clear_request_data)
 
     def process_pending_requests(self):
         """Main loop to process pending requests."""
@@ -821,10 +833,21 @@ class TinkerEngine:
                 other_requests = self.find_single_requests(session)
 
             # Process batches outside of session context
+            # forward_backward/forward requests carry the full per-token training batch
+            # (tokens, weights, advantages, logprobs, values, returns) -- clear their
+            # persisted request_data once completed, since nothing reads it back after
+            # that (see _complete_futures docstring). This is the dominant contributor
+            # to tinker.db's steady per-step growth.
             self.process_batch_requests(
-                forward_backward_requests, self.process_forward_backward, "forward_backward", per_model=True
+                forward_backward_requests,
+                self.process_forward_backward,
+                "forward_backward",
+                per_model=True,
+                clear_request_data=True,
             )
-            self.process_batch_requests(forward_requests, self.process_forward, "forward", per_model=True)
+            self.process_batch_requests(
+                forward_requests, self.process_forward, "forward", per_model=True, clear_request_data=True
+            )
             self.process_batch_requests(sample_requests, self.process_sample, "sample")
 
             # Process other request types individually (in the future we can also batch independent optim_steps)
