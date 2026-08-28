@@ -691,8 +691,29 @@ class WorkerDispatch:
             if is_lora and not (
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):
-                # in-place lora case (mostly for multi-tenant training) - no need to pause - can just rely on load_lora_adapter to swap adapter in place
-                _broadcast_and_finish()
+                # in-place lora case (mostly for multi-tenant training): the
+                # adapter swap itself (load_lora_adapter) is in-place and safe
+                # without pausing. BUT fsdp_worker.broadcast_to_inference_engines
+                # also fires reset_prefix_cache(reset_running_requests=True)
+                # whenever fully_async is disabled (our case) -- and that call's
+                # own justification ("generation is complete at sync time, so
+                # there are no in-flight requests to preserve") does not hold
+                # for a staleness=1 pipeline, where generation workers keep
+                # producing the NEXT batch while this one trains. Confirmed
+                # live: without pausing here, reset_running_requests=True hits
+                # real in-flight completions and the vLLM engine's own request
+                # loop goes completely silent (no periodic stats log at all,
+                # which otherwise fires every 10s even when idle) for ~2
+                # minutes per weight sync -- every agent call in flight during
+                # that window times out. Pausing first (matching the
+                # non-colocated branch below) means reset_running_requests has
+                # nothing live left to disrupt.
+                await self._inference_engine_client.pause_generation()
+                try:
+                    self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+                    self._finish_weight_sync()
+                finally:
+                    await self._inference_engine_client.resume_generation()
             elif self.cfg.generator.inference_engine.offload_kv_for_weight_sync:
                 # Sleep the engine to free GPU memory during the sync (wake weights,
                 # broadcast, wake KV cache) so gpu_memory_utilization can run higher.
