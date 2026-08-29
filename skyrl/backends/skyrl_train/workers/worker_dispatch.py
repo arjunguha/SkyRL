@@ -103,7 +103,8 @@ class WorkerDispatch:
         path can skip that backload: Megatron LoRA offload keeps the LoRA DDP
         buffers resident even when frozen base weights are offloaded.
         """
-        if model_id is None or role not in self._actor_groups:
+        # Critics are single-tenant and do not use the policy adapter store.
+        if role == "critic" or model_id is None or role not in self._actor_groups:
             return
         if require_model_resident:
             self._ensure_on_gpu(role, need_optimizer=False, need_model=True)
