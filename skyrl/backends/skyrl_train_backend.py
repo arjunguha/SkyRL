@@ -10,7 +10,7 @@ from typing import Callable
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from ray.util.placement_group import placement_group
 from transformers import AutoTokenizer
 
@@ -68,6 +68,19 @@ class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "fsdp"
+    policy_gpu_fraction: float | None = None
+    critic_gpu_fraction: float | None = None
+
+    @model_validator(mode="after")
+    def validate_gpu_fractions(self):
+        if (self.policy_gpu_fraction is None) != (self.critic_gpu_fraction is None):
+            raise ValueError("policy_gpu_fraction and critic_gpu_fraction must be set together")
+        if self.policy_gpu_fraction is not None:
+            if not 0 < self.policy_gpu_fraction <= 1 or not 0 < self.critic_gpu_fraction <= 1:
+                raise ValueError("policy_gpu_fraction and critic_gpu_fraction must be in (0, 1]")
+            if self.policy_gpu_fraction + self.critic_gpu_fraction > 1:
+                raise ValueError("policy_gpu_fraction and critic_gpu_fraction must sum to at most 1")
+        return self
 
 
 class MegatronBackendOverrides(SkyRLTrainBackendOverrides):
@@ -93,7 +106,10 @@ def _build_skyrl_train_config(
     # NOTE: It is better to add this as a part of the CLI overrides since we have post_init logic
     # that resolves other config derived from the policy model path.
     user_overrides["trainer.policy.model.path"] = base_model
-    user_overrides["trainer.critic.model.path"] = base_model
+    if overrides.strategy == "fsdp":
+        user_overrides.setdefault("trainer.critic.model.path", base_model)
+    else:
+        user_overrides["trainer.critic.model.path"] = base_model
     # Strategy must be set on the override dict (not after from_cli_overrides) so
     # TrainerConfig.__post_init__ sees the right value during validation —
     # e.g. logprobs_chunk_size=None is only valid when strategy=megatron.
@@ -265,7 +281,7 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg.trainer.placement.policy_num_gpus_per_node,
             PolicyWorker,
             pg=pg,
-            num_gpus_per_actor=0.2 if colocate_all else 1,
+            num_gpus_per_actor=0.2 if colocate_all else (getattr(self.config, "policy_gpu_fraction", None) or 1),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
             record_memory=cfg.trainer.policy.record_memory,
@@ -326,7 +342,7 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg.trainer.placement.critic_num_gpus_per_node,
             CriticWorker,
             pg=self._colocate_pg,
-            num_gpus_per_actor=0.2 if colocate_all else 1,
+            num_gpus_per_actor=0.2 if colocate_all else (getattr(self.config, "critic_gpu_fraction", None) or 1),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
         )

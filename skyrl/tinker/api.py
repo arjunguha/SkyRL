@@ -451,6 +451,21 @@ class CreateModelRequest(BaseModel):
     base_model: str
     lora_config: LoRAConfig
     model_role: str = "policy"
+    user_metadata: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def apply_model_role_from_metadata(self):
+        """Activate SkyRL's existing FSDP critic path for stock Tinker clients.
+
+        The API, engine, backend, and FSDPCriticWorkerBase already create a
+        critic from the internal model_role; Tinker exposes that choice through
+        user_metadata.
+        """
+        model_role = (self.user_metadata or {}).get("model_role", self.model_role)
+        if model_role not in ("policy", "critic"):
+            raise ValueError("model_role must be 'policy' or 'critic'")
+        self.model_role = model_role
+        return self
 
 
 class CreateModelResponse(BaseModel):

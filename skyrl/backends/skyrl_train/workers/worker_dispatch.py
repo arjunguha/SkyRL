@@ -94,7 +94,8 @@ class WorkerDispatch:
         Must be called *after* ``_ensure_on_gpu(role, ...)`` so the model
         and optimizer storages are live before we tensor.copy_() into them.
         """
-        if model_id is None or role not in self._actor_groups:
+        # Critics are single-tenant and do not use the policy adapter store.
+        if role == "critic" or model_id is None or role not in self._actor_groups:
             return
         ray.get(self._actor_groups[role].async_run_ray_method("pass_through", "swap_to_adapter", model_id))
 
