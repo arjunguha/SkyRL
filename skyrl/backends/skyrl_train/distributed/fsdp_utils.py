@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 from collections import OrderedDict
 from typing import Union
 
@@ -217,6 +218,20 @@ def fsdp2_get_full_state_dict(model: torch.nn.Module, cpu_offload=True, rank0_on
     if rank0_only and dist.get_rank() != 0:
         # Clear the state dict on non-rank-0 processes to save memory
         state_dict.clear()
+        # .clear() only drops this dict's own references -- every rank just
+        # transiently materialized a full unsharded copy for the collective
+        # gather above (torch.distributed.checkpoint.state_dict.
+        # get_model_state_dict runs on all ranks regardless of rank0_only),
+        # so on the ranks about to throw it away entirely, force the
+        # tensors' memory back to the allocator now rather than leaving it
+        # to whenever the next GC cycle happens to run. This call repeats
+        # every training step (see save_sampler_checkpoint's per-step
+        # sync_weights path) with no gap in between, so anything left
+        # lingering here compounds call over call -- confirmed live
+        # 2026-08-29: this exact gather, called ~30x/hour with no cleanup,
+        # preceded an OOM (anon RSS 28G->741G in under 2 minutes, see
+        # save_hf_model's own cleanup below for the rank-0 half of this).
+        gc.collect()
 
     return state_dict
 

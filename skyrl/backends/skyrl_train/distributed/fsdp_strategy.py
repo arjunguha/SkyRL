@@ -692,6 +692,17 @@ class FSDPStrategy(DistributedStrategy):
 
             self.print(f"[rank-0]: Successfully saved model to {output_dir}")
 
+        # save_pretrained is done with it -- drop rank 0's own full unsharded
+        # copy now instead of leaving it for whenever the next GC cycle
+        # happens to run. This function gets called every training step (the
+        # per-step sampler-weight sync path has no way to skip the persisted
+        # HF export -- see save_sampler_checkpoint's own comment), so any
+        # lingering reference here compounds call over call rather than
+        # being one-off: confirmed live 2026-08-29, this gather with no
+        # cleanup preceded an OOM (anon RSS 28G->741G in under 2 minutes).
+        del output_state_dict
+        gc.collect()
+
         dist.barrier()
 
     @contextmanager
