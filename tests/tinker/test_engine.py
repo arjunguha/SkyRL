@@ -8,7 +8,13 @@ from sqlmodel import Session, SQLModel
 
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
-from skyrl.tinker.db_models import FutureDB, ModelDB, RequestStatus, SessionDB
+from skyrl.tinker.db_models import (
+    FutureDB,
+    ModelDB,
+    RequestStatus,
+    SamplingSessionDB,
+    SessionDB,
+)
 from skyrl.tinker.engine import (
     TinkerEngine,
     prepare_model_pass_batch,
@@ -105,11 +111,27 @@ def test_cleanup_stale_sessions():
                 session_id=session_id,
             )
         )
+        # An ephemeral sampling session created by this session (e.g. via
+        # save_weights_and_get_sampling_client, the per-step sampler-weight
+        # sync path) -- see cleanup_stale_sessions's own comment for why this
+        # needs purging alongside the session/model it belongs to.
+        sampling_session_id = "stale_sampling_session"
+        session.add(
+            SamplingSessionDB(
+                sampling_session_id=sampling_session_id,
+                session_id=session_id,
+                sampling_session_seq_id=0,
+                model_path=f"tinker://{model_id}/sampler_weights/ss0_seq1",
+            )
+        )
         session.commit()
 
-    # Run cleanup and assert one model was unloaded
+    # Run cleanup and assert one model was unloaded, and the stale session's
+    # ephemeral sampling-session row was purged along with it.
     assert engine.cleanup_stale_sessions() == 1
     assert not engine.backend.has_model(model_id)
+    with Session(engine.db_engine) as session:
+        assert session.get(SamplingSessionDB, sampling_session_id) is None
 
 
 @pytest.mark.parametrize(

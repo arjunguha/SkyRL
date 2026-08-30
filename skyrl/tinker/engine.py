@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
-from sqlmodel import Session, create_engine, func, select, update
+from sqlmodel import Session, create_engine, delete, func, select, update
 
 from skyrl.backends.utils import log_timing
 from skyrl.tinker import types
@@ -22,6 +22,7 @@ from skyrl.tinker.db_models import (
     FutureDB,
     ModelDB,
     RequestStatus,
+    SamplingSessionDB,
     SessionDB,
     enable_sqlite_wal,
 )
@@ -602,6 +603,14 @@ class TinkerEngine:
                 _ = session.exec(
                     update(SessionDB).where(SessionDB.session_id.in_(sessions_to_expire)).values(status="expired")
                 )
+                # Ephemeral sampling sessions (save_weights_and_get_sampling_client,
+                # e.g. the per-step sampler-weight sync in agentic_harbor_trainer's
+                # sync_weights(persist=False)) create a SamplingSessionDB row per
+                # call that's otherwise never deleted anywhere in this codebase --
+                # unlike checkpoints/futures, nothing here ever reads an old one
+                # back. Once their owning session is stale, they're pure dead
+                # weight; clear them out here rather than growing tinker.db forever.
+                _ = session.exec(delete(SamplingSessionDB).where(SamplingSessionDB.session_id.in_(sessions_to_expire)))
             session.commit()
 
         for session_id in sessions_to_expire:
