@@ -79,6 +79,21 @@ def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
 
 
 @torch.no_grad()
+def move_fsdp2_model_buffers_to_device(model, device):
+    """Move buffers without moving FSDP-managed parameters.
+
+    FSDP2's CPU offload policy stages parameters for compute but does not stage
+    ordinary module buffers. ``model.to(device)`` cannot be used here because
+    it would also defeat parameter offload. This matters for models such as
+    Gemma 4 whose decoder layers use persistent ``layer_scalar`` buffers.
+    """
+    for module in model.modules():
+        for key, buffer in module._buffers.items():
+            if buffer is not None and buffer.device != torch.device(device):
+                module._buffers[key] = buffer.to(device, non_blocking=True)
+
+
+@torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
     device = torch.cuda.current_device()
     model.to(device, non_blocking=True)
@@ -165,10 +180,10 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     _sync_non_persistent_buffers(model, {})
 
     if cpu_offload:
-        # Caller asked for CPU-resident params; the offload path is still
-        # broken for FSDP2 but we leave the request explicit so a future fix
-        # has an obvious hook.
+        # CPUOffloadPolicy stages parameters, gradients, and optimizer state,
+        # but not ordinary module buffers. Keep those on the compute device.
         offload_fsdp2_model_to_cpu(model)
+        move_fsdp2_model_buffers_to_device(model, torch.cuda.current_device())
     return model
 
 
