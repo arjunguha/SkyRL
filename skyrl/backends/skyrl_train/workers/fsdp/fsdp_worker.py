@@ -36,6 +36,7 @@ from skyrl.backends.skyrl_train.weight_sync.weight_extractor_utils import (
 from skyrl.backends.skyrl_train.workers.model_wrapper import (
     HFModelWrapper,
     get_llm_for_sequence_regression,
+    should_load_in_bfloat16,
 )
 from skyrl.backends.skyrl_train.workers.worker import (
     CriticWorkerBase,
@@ -164,7 +165,14 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         wrapped_model = HFModelWrapper(
             model_path,
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=self.cfg.policy.inference_only_init,
+            # Preserve the checkpoint's native bf16 storage dtype. Previously,
+            # every trainable FSDP policy was widened to fp32 here even when all
+            # source tensors were bf16; FSDP mixed precision then cast them back
+            # to bf16 for compute and save_state wrote the widened fp32 shards.
+            bf16=should_load_in_bfloat16(
+                model_config,
+                force_bfloat16=self.cfg.policy.inference_only_init,
+            ),
             lora_rank=self.cfg.policy.model.lora.rank,
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,
@@ -395,7 +403,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             model_path,
             "critic",
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=False,
+            bf16=should_load_in_bfloat16(model_config),
             lora_rank=self.cfg.critic.model.lora.rank,
             lora_alpha=self.cfg.critic.model.lora.alpha,
             lora_dropout=self.cfg.critic.model.lora.dropout,
@@ -459,7 +467,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
         wrapped_model = HFModelWrapper(
             model_path,
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=self.cfg.bf16,
+            bf16=should_load_in_bfloat16(model_config, force_bfloat16=self.cfg.bf16),
             sequence_parallel_size=self.cfg.ref.sequence_parallel_size,
             remove_microbatch_padding=self.cfg.remove_microbatch_padding,
             model_config_kwargs=self.cfg.ref.model_config_kwargs,
