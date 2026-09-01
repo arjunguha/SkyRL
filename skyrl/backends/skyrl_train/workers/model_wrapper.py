@@ -33,6 +33,27 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
 )
 
 
+def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bool:
+    """Whether a Hugging Face model should be materialized in bfloat16.
+
+    Training callers may explicitly force bfloat16, but otherwise native
+    bfloat16 checkpoints should stay bfloat16 instead of being widened to
+    float32 on load.  Transformers 5 stores the checkpoint dtype on
+    ``config.dtype``; the ``torch_dtype`` fallback keeps this compatible with
+    older/local configs.
+    """
+    if force_bfloat16:
+        return True
+
+    native_dtype = getattr(model_config, "dtype", None)
+    if native_dtype is None:
+        native_dtype = getattr(model_config, "torch_dtype", None)
+    if isinstance(native_dtype, str):
+        native_dtype = native_dtype.removeprefix("torch.").lower()
+        return native_dtype in {"bf16", "bfloat16"}
+    return native_dtype == torch.bfloat16
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -196,7 +217,14 @@ class HFModelWrapper(nn.Module):
                     bias="none",
                     init_lora_weights=True if lora_init_method == "kaiming" else lora_init_method,
                 )
-                self.model = get_peft_model(self.model, lora_config)
+                # PEFT promotes fp16/bf16 adapter weights to fp32 by default.
+                # Keep adapters in the same dtype as a natively-bf16 base model
+                # so the FSDP model (and its eventual checkpoint) stays bf16.
+                self.model = get_peft_model(
+                    self.model,
+                    lora_config,
+                    autocast_adapter_dtype=not bf16,
+                )
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
@@ -225,6 +253,14 @@ class HFModelWrapper(nn.Module):
             # https://github.com/huggingface/transformers/issues/26877
             # Use `model.generate(use_cache=True)` instead.`
             self.model.config.use_cache = False
+
+            parameter_dtypes = sorted({str(param.dtype) for param in self.model.parameters()})
+            trainable_dtypes = sorted({str(param.dtype) for param in self.model.parameters() if param.requires_grad})
+            logger.info(
+                "Loaded model parameters with dtypes {}; trainable parameters with dtypes {}",
+                parameter_dtypes,
+                trainable_dtypes,
+            )
         else:
             self.model = pretrain_or_model
 

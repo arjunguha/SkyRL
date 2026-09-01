@@ -2,7 +2,45 @@ import pytest
 import torch
 from flash_attn.bert_padding import pad_input, unpad_input
 
-from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
+from skyrl.backends.skyrl_train.workers.model_wrapper import (
+    HFModelWrapper,
+    should_load_in_bfloat16,
+)
+
+
+class _FakeModelConfig:
+    def __init__(self, *, dtype=None, torch_dtype=None):
+        self.dtype = dtype
+        self.torch_dtype = torch_dtype
+
+
+@pytest.mark.parametrize(
+    ("config", "force_bfloat16", "expected"),
+    [
+        (_FakeModelConfig(dtype=torch.bfloat16), False, True),
+        (_FakeModelConfig(dtype="bfloat16"), False, True),
+        (_FakeModelConfig(dtype="torch.bfloat16"), False, True),
+        (_FakeModelConfig(dtype=torch.float32), False, False),
+        (_FakeModelConfig(dtype="float16"), False, False),
+        (_FakeModelConfig(dtype=None, torch_dtype=torch.bfloat16), False, True),
+        (_FakeModelConfig(dtype=torch.float32), True, True),
+    ],
+)
+def test_should_load_in_bfloat16(config, force_bfloat16: bool, expected: bool) -> None:
+    assert should_load_in_bfloat16(config, force_bfloat16=force_bfloat16) is expected
+
+
+def test_bfloat16_lora_adapters_are_not_promoted_to_float32() -> None:
+    wrapper = HFModelWrapper(
+        "llamafactory/tiny-random-Llama-3",
+        bf16=True,
+        lora_rank=2,
+        target_modules=["q_proj"],
+    )
+
+    trainable_parameters = [parameter for parameter in wrapper.parameters() if parameter.requires_grad]
+    assert trainable_parameters
+    assert {parameter.dtype for parameter in trainable_parameters} == {torch.bfloat16}
 
 
 @pytest.fixture
