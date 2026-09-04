@@ -996,7 +996,9 @@ async def get_sampler(sampler_id: str, session: AsyncSession = Depends(get_sessi
 
 
 @app.post("/api/v1/create_model", response_model=CreateModelResponse)
-async def create_model(request: CreateModelRequest, session: AsyncSession = Depends(get_session)):
+async def create_model(
+    request: CreateModelRequest, req: Request, session: AsyncSession = Depends(get_session)
+):
     """Create a new model, optionally with a LoRA adapter."""
     # Validate session exists
     session_db = await session.get(SessionDB, request.session_id)
@@ -1005,10 +1007,15 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
 
     model_id = f"model_{uuid4().hex[:8]}"
 
-    # alpha = 32 seems to be the tinker default (see https://thinkingmachines.ai/blog/lora/)
+    # alpha = 32 is the default (see https://thinkingmachines.ai/blog/lora/),
+    # overridable per-server via --lora-alpha -- there is no per-request
+    # alpha field because the real Tinker SDK's
+    # create_lora_training_client_async() doesn't expose one either.
     # Generate a random seed if not provided
     seed = request.lora_config.seed if request.lora_config.seed is not None else random.randint(0, 2**31 - 1)
-    lora_config = types.LoraConfig(rank=request.lora_config.rank, alpha=32.0, seed=seed)
+    lora_config = types.LoraConfig(
+        rank=request.lora_config.rank, alpha=req.app.state.engine_config.lora_alpha, seed=seed
+    )
     request_id = await create_future(
         session=session,
         request_type=types.RequestType.CREATE_MODEL,

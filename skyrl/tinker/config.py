@@ -15,6 +15,18 @@ class EngineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     base_model: str = Field(..., description="Base model name (e.g., Qwen/Qwen3-0.6B)")
+    lora_alpha: float = Field(
+        default=32.0,
+        description=(
+            "LoRA alpha applied to every adapter this server creates. The "
+            "create_model request has no client-settable alpha field (the "
+            "real Tinker SDK's create_lora_training_client_async() has no "
+            "alpha parameter at all -- alpha/rank is a server-side scale "
+            "decision, not a per-request one), so this is a launch-time flag "
+            "instead. One server process serves one training run's worth of "
+            "adapters in practice, same granularity as --base-model."
+        ),
+    )
     backend: str = Field(default="jax", description="Backend to use for training and inference")
     backend_config: dict = Field(
         default_factory=dict,
