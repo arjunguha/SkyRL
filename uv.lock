@@ -677,6 +677,18 @@ wheels = [
 ]
 
 [[package]]
+name = "bounded-subprocess"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typeguard" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bd/d8/4db0f5d99415d52a0594509f117c4ca643cea0c2d772a1be18c1c56e1860/bounded_subprocess-2.8.0.tar.gz", hash = "sha256:aa58dba36cabaf5130cd5ac69e46968921bc96543db9452f61d979503c61781d", size = 61526, upload-time = "2026-05-14T10:21:23.711Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8b/71/4492a2a5e8071c97095dce7ff26a05919d1c4c04c3076971e8c1139d2451/bounded_subprocess-2.8.0-py3-none-any.whl", hash = "sha256:f8f779a5715cc156593b143925de1fe4be86d25a7f747b011a49713699fd3691", size = 16188, upload-time = "2026-05-14T10:21:24.9Z" },
+]
+
+[[package]]
 name = "cachetools"
 version = "7.1.7"
 source = { registry = "https://pypi.org/simple" }
@@ -8963,6 +8975,7 @@ megatron = [
 ]
 miniswe = [
     { name = "accelerate" },
+    { name = "bounded-subprocess" },
     { name = "datasets" },
     { name = "debugpy" },
     { name = "fastapi" },
@@ -9056,6 +9069,7 @@ requires-dist = [
     { name = "aiosqlite", marker = "extra == 'tinker'" },
     { name = "alembic", marker = "extra == 'dev'" },
     { name = "asyncpg", marker = "extra == 'tinker'" },
+    { name = "bounded-subprocess", marker = "extra == 'miniswe'", specifier = "==2.8.0" },
     { name = "causal-conv1d", marker = "sys_platform == 'linux' and extra == 'fsdp'", specifier = "==1.6.2.post1+cu.13.0.torch.2.11", index = "https://wheels.astral.sh/simple/cu130/" },
     { name = "causal-conv1d", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.6.2.post1+cu.13.0.torch.2.11", index = "https://wheels.astral.sh/simple/cu130/" },
     { name = "cloudpathlib", specifier = ">=0.23.0" },
@@ -10209,6 +10223,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/02/7f/8a78361f752274a550a7f6f07f127b246ece7d7fdde31121d22074e46eab/ty-0.0.66-py3-none-win32.whl", hash = "sha256:d28c3df565a387c1c5ea359aa452a46d19163616ef71be819058a424a62f1ae1", size = 11782494, upload-time = "2026-08-04T01:09:40.136Z" },
     { url = "https://files.pythonhosted.org/packages/7d/e2/deed22b823ce309b8410d50414fd15afe9e90aee8b8ca04789ba55c21231/ty-0.0.66-py3-none-win_amd64.whl", hash = "sha256:e3a457f3312c078f24c47d0da6e4f73de34d0a77ed2de22571c066c80b2fd5e7", size = 12893338, upload-time = "2026-08-04T01:09:42.825Z" },
     { url = "https://files.pythonhosted.org/packages/f9/ce/6c828f42ef1ed39f53f57f9c0cdcdf03e23666fa7a29d799042a2c34bcb4/ty-0.0.66-py3-none-win_arm64.whl", hash = "sha256:2f62ae247b9c75674fcc060635f9f00210357da7681de59234d97b50fb9e9e94", size = 12227381, upload-time = "2026-08-04T01:09:45.365Z" },
+]
+
+[[package]]
+name = "typeguard"
+version = "4.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b4/de/4420db493fa8fc0856d5e5c1b159c63a323d2de2317babe36b01568928e8/typeguard-4.6.0.tar.gz", hash = "sha256:e7414f09111317de3e335de92cd397c5c0ca00b1cc1676de12e1d444a79b3f21", size = 82330, upload-time = "2026-07-26T08:40:23.207Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/eb/461d5f167b6f5c7d97696f397c82f82e3480e003fce3f0a1cd1dd26e2eb2/typeguard-4.6.0-py3-none-any.whl", hash = "sha256:79878165bb86f2cf5d41d159a0ff1792a796cf496882d2fe1b1c6c7049b9cdd7", size = 36884, upload-time = "2026-07-26T08:40:21.868Z" },
 ]
 
 [[package]]

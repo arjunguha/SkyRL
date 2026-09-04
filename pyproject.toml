@@ -174,6 +174,11 @@ miniswe = [
     # NOTE (sumanthrh): Needs to be a commit after https://github.com/SWE-agent/mini-swe-agent/commit/4f5d445e99d13b5482478c23508bf2fbf7c0670c
     "mini-swe-agent>=1.12.0",
     "litellm",
+    # training-tokenmaxxing's agentic_harbor_trainer imports this lazily
+    # (tvgpo_reward.py) only when --use-tvgpo-reward/--use-tvgpo-v-reward is
+    # actually requested -- needed here (not just there) because this
+    # server/client pair runs under this venv, not a separate one.
+    "bounded_subprocess==2.8.0",
 ]
 harbor = [
     "harbor[daytona,modal]; python_version >= '3.12'",
