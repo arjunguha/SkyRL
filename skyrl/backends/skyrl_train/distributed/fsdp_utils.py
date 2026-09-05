@@ -184,7 +184,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
         # CPUOffloadPolicy stages parameters, gradients, and optimizer state,
         # but not ordinary module buffers. Keep those on the compute device.
         offload_fsdp2_model_to_cpu(model)
-        move_fsdp2_model_buffers_to_device(model, torch.cuda.current_device())
+    move_fsdp2_model_buffers_to_device(model, torch.cuda.current_device())
     return model
 
 

@@ -165,7 +165,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         wrapped_model = HFModelWrapper(
             model_path,
-            use_flash_attention_2=self.cfg.flash_attn,
+            attn_implementation=self.cfg.attn_implementation,
             # Preserve the checkpoint's native bf16 storage dtype. Previously,
             # every trainable FSDP policy was widened to fp32 here even when all
             # source tensors were bf16; FSDP mixed precision then cast them back
@@ -442,7 +442,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         critic = get_llm_for_sequence_regression(
             model_path,
             "critic",
-            use_flash_attention_2=self.cfg.flash_attn,
+            attn_implementation=self.cfg.attn_implementation,
             bf16=should_load_in_bfloat16(model_config),
             lora_rank=self.cfg.critic.model.lora.rank,
             lora_alpha=self.cfg.critic.model.lora.alpha,
@@ -506,7 +506,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
         wrapped_model = HFModelWrapper(
             model_path,
-            use_flash_attention_2=self.cfg.flash_attn,
+            attn_implementation=self.cfg.attn_implementation,
             bf16=should_load_in_bfloat16(model_config, force_bfloat16=self.cfg.bf16),
             sequence_parallel_size=self.cfg.ref.sequence_parallel_size,
             remove_microbatch_padding=self.cfg.remove_microbatch_padding,
