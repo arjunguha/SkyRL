@@ -1456,6 +1456,12 @@ class TrainerConfig(BaseConfig):
     Prompts longer than this are filtered out of the train/eval datasets at load time, not
     truncated."""
     flash_attn: bool = True
+    attn_implementation: str = "sdpa"
+    """Transformers attention implementation used by the FSDP backend.
+
+    Accepts the same implementation string as Transformers' ``attn_implementation``
+    argument, including names registered through ``AttentionInterface``.
+    """
     disable_fast_tokenizer: bool = False
     project_name: str = "skyrl"
     """Project name in WandB and MLflow."""

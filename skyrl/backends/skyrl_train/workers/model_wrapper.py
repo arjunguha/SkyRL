@@ -9,8 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
+from more_transformers import register_fa4_sdpa_attention
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
@@ -27,10 +27,13 @@ from skyrl.backends.skyrl_train.distributed.ulysses.utils import (
     ulysses_pad_and_slice_inputs,
 )
 from skyrl.backends.skyrl_train.training_batch import TensorList
+from skyrl.backends.skyrl_train.utils.packing import pad_input, unpad_input
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+
+register_fa4_sdpa_attention()
 
 
 def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bool:
@@ -62,7 +65,9 @@ class HFModelWrapper(nn.Module):
 
     Args:
         pretrain_or_model (nn.Module): A pretrained model or a new model instance to be used as the actor.
-        use_flash_attention_2 (bool, optional): Whether to utilize Flash Attention 2.0 for improved performance. Defaults to False.
+        attn_implementation (str, optional): Transformers attention implementation.
+        use_flash_attention_2 (bool, optional): Deprecated compatibility switch used
+            only when ``attn_implementation`` is not provided.
         bf16 (bool, optional): Enable bfloat16 precision for model computations. Defaults to True.
         load_in_4bit (bool, optional): Load the model in 4-bit precision. Defaults to False.
         lora_rank (int, optional): Rank for LoRA adaptation. Defaults to 0.
@@ -81,6 +86,7 @@ class HFModelWrapper(nn.Module):
         self,
         pretrain_or_model,
         use_flash_attention_2=False,
+        attn_implementation: str | None = None,
         bf16=True,
         load_in_4bit=False,
         # TODO(shu): combine all LoRA specific configs into one place?
@@ -105,13 +111,11 @@ class HFModelWrapper(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.sequence_parallel_size = sequence_parallel_size
-        self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
+        self.attn_implementation = attn_implementation or (
+            "flash_attention_2" if use_flash_attention_2 else "sdpa"
+        )
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
-        if remove_microbatch_padding:
-            assert (
-                self.attn_implementation == "flash_attention_2"
-            ), "Flash attention 2 should be used for `remove_microbatch_padding`"
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -562,6 +566,7 @@ def get_llm_for_sequence_regression(
     exclude_modules=None,
     lora_dropout=0,
     use_flash_attention_2=False,
+    attn_implementation: str | None = None,
     init_value_head: bool = False,
     value_head_prefix="value_head",
     device_map=None,
@@ -577,15 +582,20 @@ def get_llm_for_sequence_regression(
         model_name_or_path (str): Path to pretrained model.
         model_type (str): Type of sequence classification model. Only `critic` is supported.
         bf16 (bool, optional): Whether enable bfloat16. Defaults to True.
-        use_flash_attention_2 (bool, optional): Whether use Flash Attention 2.0. Defaults to False.
+        attn_implementation (str, optional): Transformers attention implementation.
+        use_flash_attention_2 (bool, optional): Deprecated compatibility switch used
+            only when ``attn_implementation`` is not provided.
 
     Returns:
         nn.Module: pretrained transformer model.
     """
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
 
+    resolved_attn_implementation = attn_implementation or (
+        "flash_attention_2" if use_flash_attention_2 else "sdpa"
+    )
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
-    config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
+    config._attn_implementation = resolved_attn_implementation
 
     base_class = AutoModel._model_mapping[type(config)]
     base_pretrained_class = base_class.__base__
