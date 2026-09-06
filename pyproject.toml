@@ -113,6 +113,7 @@ skyrl-train = [
 fsdp = [
     "skyrl[skyrl-train]",
     "more-transformers",
+    "quack-kernels==0.6.4",
     "vllm==0.26.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
     # The `nixl` shim provides that namespace and dispatches on `torch.version.cuda`,

@@ -27,6 +27,8 @@ try:
 except ImportError:
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 
+from quack import cross_entropy as quack_cross_entropy_loss
+
 
 def chunked_cross_entropy_from_log_probs(
     logprobs: Float[torch.Tensor, "batch_size seqlen vocab_size"],
@@ -141,7 +143,14 @@ def logprobs_from_logits(
         output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
         output = output.view(*batch_dim)
     else:
-        output = logprobs_from_logits_v2(logits, labels)
+        batch_dim = logits.shape[:-1]
+        last_dim = logits.shape[-1]
+        output = -quack_cross_entropy_loss(
+            logits.reshape(-1, last_dim),
+            labels.reshape(-1),
+            reduction="none",
+            inplace_backward=inplace_backward,
+        ).view(*batch_dim)
     return output
 
 
