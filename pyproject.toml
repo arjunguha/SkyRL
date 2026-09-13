@@ -129,6 +129,21 @@ fsdp = [
     "flashinfer-jit-cache==0.6.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-cubin==0.6.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux'",
+    # Previously only declared under megatron's own extra (its worker has a
+    # real, hard flash_attn dependency for its "flash" attention_backend
+    # option) -- but torch_utils.py's logprobs_from_logits (used by fsdp
+    # too) ALSO tries flash_attn.ops.triton.cross_entropy first, falling
+    # back to quack's cross_entropy only if that import fails. quack's
+    # CUTLASS-DSL backend has a real, unfixed upstream bug compiling for
+    # B200 (sm_100a) as of nvidia-cutlass-dsl 4.6.0 through 4.8.0.dev0
+    # (confirmed live, 2026-09-13: "NVVM backend compilation failed...
+    # invalid operand for inline asm constraint 'i'", reproduced on two
+    # separate B200 nodes, independent of cutlass-dsl version) -- with
+    # flash-attn present, fsdp never touches that broken path at all.
+    # Declared here too so `uv sync --extra fsdp` (without megatron, which
+    # this project's own fsdp-only setup never combines with it per
+    # CLAUDE.md's "never combine backend extras") still gets it.
+    "flash-attn==2.8.3+cu.13.0.torch.2.11; sys_platform == 'linux'",
 ]
 
 megatron = [
