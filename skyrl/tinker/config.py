@@ -42,6 +42,25 @@ class EngineConfig(BaseModel):
         description="Database URL (e.g., postgresql://user:password@localhost:5432/tinker). If not set, uses SKYRL_DATABASE_URL env var or defaults to SQLite",
         json_schema_extra={"argparse_type": str, "env_var": "SKYRL_DATABASE_URL"},
     )
+    db_pool_size: int = Field(
+        default=40,
+        description=(
+            "SQLAlchemy connection pool size for --database-url. Sized for "
+            "concurrency, not for storage speed: the pool decides how many "
+            "requests may WAIT for a connection instead of failing, since a "
+            "saturated pool raises after 30s and that surfaces to the client "
+            "as a non-retryable 400. Defaults high because losing a request "
+            "costs a trajectory; drop to SQLAlchemy's 5/10 when the DB is on "
+            "local disk, where writes are ~1ms and extra connections only add "
+            "aiosqlite worker threads (one per connection)."
+        ),
+        json_schema_extra={"argparse_type": int, "env_var": "SKYRL_DB_POOL_SIZE"},
+    )
+    db_max_overflow: int = Field(
+        default=80,
+        description="Connections the pool may open beyond --db-pool-size under burst.",
+        json_schema_extra={"argparse_type": int, "env_var": "SKYRL_DB_MAX_OVERFLOW"},
+    )
     external_inference_url: str | None = Field(
         default=None,
         description="URL of the external inference engine. If set, sample requests will be sent to the external engine instead (currently only VLLM is supported).",

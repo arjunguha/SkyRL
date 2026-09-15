@@ -233,7 +233,14 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
 
     db_url = get_async_database_url(app.state.engine_config.database_url)
-    app.state.db_engine = create_async_engine(db_url, echo=False)
+    # Pool size tracks request concurrency, not storage speed -- see
+    # --db-pool-size. SQLAlchemy's 5+10 default drops requests once a
+    # write-back is slow enough that the queue outlives the 30s checkout
+    # timeout, which is reachable when the DB is on a network filesystem.
+    cfg = app.state.engine_config
+    app.state.db_engine = create_async_engine(
+        db_url, echo=False, pool_size=cfg.db_pool_size, max_overflow=cfg.db_max_overflow
+    )
     enable_sqlite_wal(app.state.db_engine.sync_engine)
 
     async with app.state.db_engine.begin() as conn:
