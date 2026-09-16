@@ -115,6 +115,7 @@ skyrl-train = [
 
 fsdp = [
     "skyrl[skyrl-train]",
+    "more-transformers; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64') and python_version < '3.15'",
     "vllm==0.28.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
     # The `nixl` shim provides that namespace and dispatches on `torch.version.cuda`,
@@ -377,6 +378,7 @@ explicit = true
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
+more-transformers = { path = "../more_transformers", editable = true }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
 flashinfer-cubin = { index = "flashinfer", marker = "sys_platform == 'linux'" }

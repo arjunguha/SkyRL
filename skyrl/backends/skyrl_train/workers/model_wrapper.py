@@ -11,6 +11,7 @@ import torch.nn as nn
 import transformers
 from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
+from more_transformers import register_fa4_sdpa_attention
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
@@ -31,6 +32,8 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+
+register_fa4_sdpa_attention()
 
 
 def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bool:
