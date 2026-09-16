@@ -9,9 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
-from more_transformers import register_fa4_sdpa_attention
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
@@ -32,8 +30,6 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
-
-register_fa4_sdpa_attention()
 
 
 def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bool:
@@ -114,6 +110,10 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = attn_implementation or (
             "flash_attention_2" if use_flash_attention_2 else "sdpa"
         )
+        if self.attn_implementation == "fa4_sdpa":
+            from more_transformers import register_fa4_sdpa_attention
+
+            register_fa4_sdpa_attention()
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
 
@@ -316,6 +316,8 @@ class HFModelWrapper(nn.Module):
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
         if self.remove_microbatch_padding:
+            from flash_attn.bert_padding import pad_input, unpad_input
+
             with torch.no_grad():
                 # Removes padding to get a packed tensor. `unpad_input` expects 3 dimensional tensor so we unsqueeze first
                 sequences_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -487,6 +489,8 @@ def _get_critic_model(
             attention_mask_fwd = attention_mask
 
             if self.remove_microbatch_padding:
+                from flash_attn.bert_padding import pad_input, unpad_input
+
                 with torch.no_grad():
                     # remove padding. `unpad_input` expects 3 dimensional tensor
                     input_ids_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -594,6 +598,10 @@ def get_llm_for_sequence_regression(
     resolved_attn_implementation = attn_implementation or (
         "flash_attention_2" if use_flash_attention_2 else "sdpa"
     )
+    if resolved_attn_implementation == "fa4_sdpa":
+        from more_transformers import register_fa4_sdpa_attention
+
+        register_fa4_sdpa_attention()
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
     config._attn_implementation = resolved_attn_implementation
 
