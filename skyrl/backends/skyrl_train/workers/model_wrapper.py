@@ -32,6 +32,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     logprobs_from_logits,
 )
 
+
 def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bool:
     """Whether a Hugging Face model should be materialized in bfloat16.
 

@@ -1508,9 +1508,6 @@ class SkyRLTrainBackend(AbstractBackend):
                     "num_samples": 1,
                     "sampling_params": sampling_params.model_dump(),
                 }
-                if wants_prompt_logprobs[i]:
-                    json_body["include_prompt_logprobs"] = True
-
                 if i in prompt_logprobs_at:
                     json_body["include_prompt_logprobs"] = True
                     if prompt_logprobs_at[i] > 0:
