@@ -876,7 +876,12 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
             ]
         )
     max_num_gpus_per_node = max(gpu_counts) if gpu_counts else 1
-    if not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
+    force_nccl_p2p_shm = os.environ.get("SKYRL_FORCE_NCCL_P2P_SHM") == "1"
+    if force_nccl_p2p_shm:
+        logger.warning("SKYRL_FORCE_NCCL_P2P_SHM=1: allowing NCCL P2P and SHM")
+        env_vars["NCCL_P2P_DISABLE"] = "0"
+        env_vars["NCCL_SHM_DISABLE"] = "0"
+    elif not peer_access_supported(max_num_gpus_per_node=max_num_gpus_per_node):
         logger.info("Peer access is not supported on this node type, disabling NCCL P2P and SHM")
         env_vars["NCCL_P2P_DISABLE"] = "1"
         env_vars["NCCL_SHM_DISABLE"] = "1"
