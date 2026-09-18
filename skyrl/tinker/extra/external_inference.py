@@ -51,6 +51,7 @@ class ExternalInferenceClient:
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
         self.external_future_store = external_future_store
+        self.thinking_token_budget = engine_config.thinking_token_budget
 
     async def call_and_store_result(
         self,
@@ -134,6 +135,8 @@ class ExternalInferenceClient:
             "stream": False,
             "return_token_ids": True,
         }
+        if self.thinking_token_budget is not None:
+            payload["thinking_token_budget"] = self.thinking_token_budget
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(request, "topk_prompt_logprobs", 0) or 0

@@ -6,7 +6,10 @@ import os
 from pathlib import Path
 
 from cloudpathlib import AnyPath
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+THINKING_TOKEN_BUDGET_KEY = "generator.sampling_params.additional_kwargs.thinking_token_budget"
 
 
 class EngineConfig(BaseModel):
@@ -108,6 +111,17 @@ class EngineConfig(BaseModel):
     `field.annotation is dict` to JSON-serialize this for the engine subprocess; a BaseModel
     annotation falls through to `str(value)` and the engine gets a repr `json.loads` cannot
     read. Validate into the model at the point of use instead."""
+
+    @model_validator(mode="after")
+    def validate_thinking_token_budget(self):
+        budget = self.backend_config.get(THINKING_TOKEN_BUDGET_KEY)
+        if budget is not None and (type(budget) is not int or budget < 0):
+            raise ValueError(f"{THINKING_TOKEN_BUDGET_KEY} must be a non-negative integer")
+        return self
+
+    @property
+    def thinking_token_budget(self) -> int | None:
+        return self.backend_config.get(THINKING_TOKEN_BUDGET_KEY)
 
 
 class TinkerTorchProfilerConfig(BaseModel):

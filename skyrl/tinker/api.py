@@ -797,7 +797,7 @@ class SamplingParams(BaseModel):
     top_k: int = -1
     top_p: float = 1
 
-    def to_types(self) -> types.SamplingParams:
+    def to_types(self, *, thinking_token_budget: int | None = None) -> types.SamplingParams:
         if self.max_tokens is None:
             raise HTTPException(status_code=400, detail="max_tokens is currently required")
         if self.max_tokens <= 0:
@@ -828,6 +828,7 @@ class SamplingParams(BaseModel):
             stop_strings=stop_strings,
             top_k=self.top_k,
             top_p=self.top_p,
+            thinking_token_budget=thinking_token_budget,
         )
 
 
@@ -1748,7 +1749,9 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     sample_input = types.SampleInput(
         base_model=base_model,
         prompt=request.prompt.to_types(),
-        sampling_params=request.sampling_params.to_types(),
+        sampling_params=request.sampling_params.to_types(
+            thinking_token_budget=req.app.state.engine_config.thinking_token_budget
+        ),
         num_samples=request.num_samples,
         checkpoint_id=checkpoint_id,
         # A positive topk implies prompt logprobs: both are read off the same

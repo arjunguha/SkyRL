@@ -95,6 +95,7 @@ _TINKER_SAMPLE_TO_VLLM_PARAM_MAP = {
     "top_p": "top_p",
     "stop_strings": "stop",
     "stop_tokens": "stop_token_ids",
+    "thinking_token_budget": "thinking_token_budget",
 }
 
 if TYPE_CHECKING:

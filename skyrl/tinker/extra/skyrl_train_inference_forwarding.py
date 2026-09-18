@@ -189,6 +189,8 @@ class SkyRLTrainInferenceForwardingClient:
             "stream": False,
             "return_token_ids": True,
         }
+        if self.engine_config.thinking_token_budget is not None:
+            payload["thinking_token_budget"] = self.engine_config.thinking_token_budget
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(sample_req, "topk_prompt_logprobs", 0) or 0

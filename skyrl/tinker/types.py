@@ -228,6 +228,7 @@ class SamplingParams(BaseModel):
     stop_strings: list[str] | None = None
     top_k: int = -1  # -1 for no limit
     top_p: float = 1.0  # 1.0 for no filtering
+    thinking_token_budget: int | None = None
 
 
 class ModelMetadata(BaseModel):
