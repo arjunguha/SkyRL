@@ -68,11 +68,14 @@ class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "fsdp"
+    critic_with_inference: bool = False
     policy_gpu_fraction: float | None = None
     critic_gpu_fraction: float | None = None
 
     @model_validator(mode="after")
     def validate_gpu_fractions(self):
+        if self.critic_with_inference and self.policy_gpu_fraction is not None:
+            raise ValueError("critic_with_inference cannot be combined with policy_gpu_fraction")
         if (self.policy_gpu_fraction is None) != (self.critic_gpu_fraction is None):
             raise ValueError("policy_gpu_fraction and critic_gpu_fraction must be set together")
         if self.policy_gpu_fraction is not None:
@@ -410,9 +413,9 @@ class SkyRLTrainBackend(AbstractBackend):
         if colocate_all:
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
             num_critic_gpus = cfg.trainer.placement.critic_num_gpus_per_node * cfg.trainer.placement.critic_num_nodes
-            assert (
-                num_policy_gpus == num_critic_gpus
-            ), "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
+            assert num_policy_gpus == num_critic_gpus, (
+                "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
+            )
 
         cfg.trainer.critic.model.lora.rank = lora_config.rank
         cfg.trainer.critic.model.lora.alpha = int(lora_config.alpha)
@@ -422,7 +425,11 @@ class SkyRLTrainBackend(AbstractBackend):
             cfg.trainer.placement.critic_num_gpus_per_node,
             CriticWorker,
             pg=self._colocate_pg,
-            num_gpus_per_actor=0.2 if colocate_all else (getattr(self.config, "critic_gpu_fraction", None) or 1),
+            num_gpus_per_actor=(
+                0.2
+                if colocate_all or getattr(self.config, "critic_with_inference", False)
+                else (getattr(self.config, "critic_gpu_fraction", None) or 1)
+            ),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
         )
@@ -531,10 +538,16 @@ class SkyRLTrainBackend(AbstractBackend):
         )
 
         is_colocated = self._cfg.trainer.placement.colocate_all
+        if getattr(self.config, "critic_with_inference", False) and "critic" in self._model_ids_to_role.values():
+            # Checkpoint loading may leave freed tensor blocks in the critic's
+            # allocator. Release those before vLLM measures available memory.
+            self._dispatch.empty_cache("critic")
         client, server_setup = build_new_inference_client(
             self._cfg,
             self._tokenizer,
-            placement_group=self._colocate_pg if is_colocated else None,
+            placement_group=self._colocate_pg
+            if (is_colocated or getattr(self.config, "critic_with_inference", False))
+            else None,
         )
         self._inference_router = server_setup.router
         self._server_groups = server_setup.server_groups
@@ -678,7 +691,27 @@ class SkyRLTrainBackend(AbstractBackend):
                 logger.info("Initializing Ray with runtime environment")
                 initialize_ray(self._cfg)
 
-            self._colocate_pg = self._create_colocate_pg() if self._cfg.trainer.placement.colocate_all else None
+            critic_with_inference = getattr(self.config, "critic_with_inference", False)
+            if critic_with_inference:
+                placement = self._cfg.trainer.placement
+                engine = self._cfg.generator.inference_engine
+                if (
+                    placement.colocate_all
+                    or engine.num_engines != 1
+                    or engine.tensor_parallel_size != 1
+                    or engine.pipeline_parallel_size != 1
+                    or engine.data_parallel_size != 1
+                    or placement.critic_num_nodes != 1
+                    or placement.critic_num_gpus_per_node != 1
+                ):
+                    raise ValueError(
+                        "critic_with_inference requires one critic GPU and one single-GPU inference engine"
+                    )
+            self._colocate_pg = (
+                self._create_colocate_pg()
+                if (self._cfg.trainer.placement.colocate_all or critic_with_inference)
+                else None
+            )
 
             if self._cfg.trainer.strategy == "fsdp":
                 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
@@ -1130,6 +1163,18 @@ class SkyRLTrainBackend(AbstractBackend):
             normalized_config["eps_clip_high"] = clip_high_threshold - 1.0
         return ("regular" if loss_fn == "ppo" else "gspo"), normalized_config or None
 
+    def _release_shared_gpu_cache(self, role: str) -> None:
+        """Return unused allocator blocks when fractional policy/critic roles switch.
+
+        Separate worker processes cannot reuse one another's CUDA cache. Keeping
+        both models resident is affordable, but retaining the inactive worker's
+        activation cache can OOM the next worker at long sequence lengths.
+        """
+        if getattr(self.config, "policy_gpu_fraction", None) is not None:
+            if getattr(self, "_last_shared_gpu_role", None) != role:
+                self._dispatch.empty_cache()
+                self._last_shared_gpu_role = role
+
     def forward_backward(
         self,
         prepared_batch: types.PreparedModelPassBatch,
@@ -1148,12 +1193,15 @@ class SkyRLTrainBackend(AbstractBackend):
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         role = self._get_batch_role(prepared_batch.all_model_ids)
+        self._release_shared_gpu_cache(role)
         loss_fn = prepared_batch.all_loss_fns[0]
         self._validate_batch_role_and_loss(role, loss_fn)
         if role == "critic" and any(
             len(values) != len(weights) or len(returns) != len(weights)
             for values, returns, weights in zip(
-                prepared_batch.all_values, prepared_batch.all_returns, prepared_batch.all_token_weights
+                prepared_batch.all_values,
+                prepared_batch.all_returns,
+                prepared_batch.all_token_weights,
             )
         ):
             raise ValueError("Critic forward_backward requires values and returns for every response token")
@@ -1240,6 +1288,7 @@ class SkyRLTrainBackend(AbstractBackend):
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         role = self._get_batch_role(prepared_batch.all_model_ids)
+        self._release_shared_gpu_cache(role)
         batch = self._to_training_batch(prepared_batch, role)
         micro_bs = (
             self._cfg.trainer.micro_forward_batch_size_per_gpu if self._cfg.trainer.strategy == "megatron" else None
@@ -1282,7 +1331,13 @@ class SkyRLTrainBackend(AbstractBackend):
             # object has no attribute 'swap_to_adapter' (confirmed via a live
             # crash) since RefWorkerBase implements no such method.
             model_id = None
-        data = self._dispatch.forward(role, batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config, model_id=model_id)
+        data = self._dispatch.forward(
+            role,
+            batch,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            model_id=model_id,
+        )
 
         # Workers emit per-sample loss_fn_outputs directly. Trim padding entries.
         per_sample_outputs = data.loss_fn_outputs

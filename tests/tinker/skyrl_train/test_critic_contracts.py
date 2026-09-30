@@ -41,6 +41,26 @@ def test_value_head_is_trainable_with_lora_and_gets_a_gradient(tmp_path):
     assert model.value_head.weight.grad.abs().sum() > 0
 
 
+def test_cache_release_only_on_shared_training_role_changes():
+    backend = SimpleNamespace(config=SimpleNamespace(policy_gpu_fraction=0.55), _dispatch=Mock())
+    for role in ["critic", "critic", "policy", "policy", "critic"]:
+        SkyRLTrainBackend._release_shared_gpu_cache(backend, role)
+    assert backend._dispatch.empty_cache.call_count == 3
+    backend = SimpleNamespace(config=SimpleNamespace(policy_gpu_fraction=None), _dispatch=Mock())
+    SkyRLTrainBackend._release_shared_gpu_cache(backend, "critic")
+    backend._dispatch.empty_cache.assert_not_called()
+
+
+def test_critic_cannot_share_policy_and_inference_simultaneously():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        FSDPBackendOverrides(
+            critic_with_inference=True,
+            policy_gpu_fraction=0.55,
+            critic_gpu_fraction=0.45,
+        )
+    assert FSDPBackendOverrides(critic_with_inference=True).critic_with_inference
+
+
 def test_single_example_critic_unpadding_preserves_values_and_gradients(tmp_path):
     config = LlamaConfig(
         vocab_size=32,
