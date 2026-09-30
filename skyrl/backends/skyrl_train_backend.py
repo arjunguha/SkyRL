@@ -68,12 +68,19 @@ class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "fsdp"
+    concurrent_actor_critic: bool = False
     critic_with_inference: bool = False
     policy_gpu_fraction: float | None = None
     critic_gpu_fraction: float | None = None
 
     @model_validator(mode="after")
     def validate_gpu_fractions(self):
+        if self.concurrent_actor_critic and (
+            not self.critic_with_inference
+            or self.policy_gpu_fraction is not None
+            or self.model_extra.get("trainer.placement.colocate_all", False)
+        ):
+            raise ValueError("concurrent_actor_critic requires separate policy/critic GPUs with critic_with_inference")
         if self.critic_with_inference and self.policy_gpu_fraction is not None:
             raise ValueError("critic_with_inference cannot be combined with policy_gpu_fraction")
         if (self.policy_gpu_fraction is None) != (self.critic_gpu_fraction is None):
@@ -1175,6 +1182,21 @@ class SkyRLTrainBackend(AbstractBackend):
                 self._dispatch.empty_cache()
                 self._last_shared_gpu_role = role
 
+    @property
+    def concurrent_model_batches(self) -> bool:
+        return (
+            getattr(self.config, "concurrent_actor_critic", False) is True
+            and self._cfg is not None
+            and not self._cfg.trainer.placement.colocate_all
+            and set(getattr(self, "_model_ids_to_role", {}).values()) <= {"policy", "critic"}
+        )
+
+    def training_execution_key(self, model_id: str) -> str:
+        """Adapters sharing workers share a serial execution queue."""
+        if not self.concurrent_model_batches:
+            raise RuntimeError("Independent training requires disjoint worker groups")
+        return self._get_role(model_id)
+
     def forward_backward(
         self,
         prepared_batch: types.PreparedModelPassBatch,
@@ -1184,7 +1206,8 @@ class SkyRLTrainBackend(AbstractBackend):
 
         self._sleep_inference_engines()
         results = {}
-        for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
+        batches = list(self._split_model_pass_batch_by_model_id(prepared_batch))
+        for sub_batch in batches:
             results.update(self._forward_backward_single_model_batch(sub_batch))
         return results
 

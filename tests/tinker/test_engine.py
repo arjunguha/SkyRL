@@ -759,3 +759,154 @@ def test_serial_fallback_when_continuous_disabled(continuous_engine):
     assert serial_batches == [[str(rid1), str(rid2)]]
     assert _future_status(engine, rid1) == RequestStatus.COMPLETED
     assert _future_status(engine, rid2) == RequestStatus.COMPLETED
+
+
+@pytest.mark.parametrize("fail_actor", [False, True])
+def test_independent_training_delayed_peer_order_and_barrier(continuous_engine, fail_actor):
+    engine = continuous_engine
+    engine.backend.concurrent_model_batches = True
+    engine.backend.training_execution_key = lambda model: model
+    started = {model: threading.Event() for model in ("actor", "critic")}
+    release = {model: threading.Event() for model in started}
+    calls = []
+
+    def backward(batch):
+        rid, (model, _) = next(iter(batch.items()))
+        calls.append(model)
+        started[model].set()
+        assert release[model].wait(5)
+        if fail_actor and model == "actor":
+            raise RuntimeError("backward failed")
+        return {rid: types.OptimStepOutput(metrics={})}
+
+    engine.process_forward_backward = backward
+    (actor,) = add_futures(
+        engine,
+        [(types.RequestType.FORWARD_BACKWARD, "actor", forward_backward_payload())],
+    )
+    try:
+        engine.process_pending_requests_once()
+        assert started["actor"].wait(1)
+        # Multiple scheduler iterations with no peer: there is no pairing window.
+        for _ in range(5):
+            engine.process_pending_requests_once()
+        assert calls == ["actor"]
+        optim, critic, barrier = add_futures(
+            engine,
+            [
+                (
+                    types.RequestType.OPTIM_STEP,
+                    "actor",
+                    {
+                        "adam_params": {
+                            "learning_rate": 0.001,
+                            "beta1": 0.9,
+                            "beta2": 0.999,
+                            "eps": 1e-8,
+                            "weight_decay": 0.0,
+                        }
+                    },
+                ),
+                (
+                    types.RequestType.FORWARD_BACKWARD,
+                    "critic",
+                    forward_backward_payload(),
+                ),
+                (types.RequestType.SAVE_WEIGHTS, "actor", {}),
+            ],
+        )
+        barriers = []
+        engine.process_single_requests = lambda requests: barriers.extend(requests)
+        engine.process_pending_requests_once()
+        assert started["critic"].wait(1)
+        assert engine.backend.order == []
+        assert barriers == []
+        release["actor"].set()
+
+        def actor_completed():
+            engine.process_pending_requests_once()
+            return _future_status(engine, optim) != RequestStatus.PENDING
+
+        assert _wait_for(actor_completed)
+        assert engine.backend.order == ([] if fail_actor else ["optim"])
+        assert barriers == []  # Critic is still executing.
+        release["critic"].set()
+        assert _wait_for(lambda: (engine.process_pending_requests_once(), bool(barriers))[1])
+        assert barriers == [str(barrier)]
+        assert calls == ["actor", "critic"]
+    finally:
+        for event in release.values():
+            event.set()
+        engine._training_executor.shutdown(wait=True)
+
+
+def test_independent_training_serializes_adapters_on_same_workers(continuous_engine):
+    engine = continuous_engine
+    engine.backend.concurrent_model_batches = True
+    engine.backend.training_execution_key = lambda _: "policy"
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def backward(batch):
+        rid, (model, _) = next(iter(batch.items()))
+        calls.append(model)
+        if model == "adapter_a":
+            started.set()
+            assert release.wait(5)
+        return {rid: types.OptimStepOutput(metrics={})}
+
+    engine.process_forward_backward = backward
+    ids = add_futures(
+        engine,
+        [
+            (types.RequestType.FORWARD_BACKWARD, model, forward_backward_payload())
+            for model in ("adapter_a", "adapter_b")
+        ],
+    )
+    try:
+        engine.process_pending_requests_once()
+        assert started.wait(1)
+        for _ in range(3):
+            engine.process_pending_requests_once()
+        assert calls == ["adapter_a"]
+        release.set()
+        assert _wait_for(
+            lambda: (
+                engine.process_pending_requests_once(),
+                _future_status(engine, ids[1]) == RequestStatus.COMPLETED,
+            )[1]
+        )
+        assert calls == ["adapter_a", "adapter_b"]
+    finally:
+        release.set()
+        engine._training_executor.shutdown(wait=True)
+
+
+def test_independent_training_preserves_sampling_batch_and_lifecycle_barrier(
+    continuous_engine,
+):
+    engine = continuous_engine
+    engine.backend.concurrent_model_batches = True
+    engine.backend.training_execution_key = lambda model: model
+    ids = add_futures(
+        engine,
+        [(types.RequestType.SAMPLE, "model_a", sample_payload(""))] * 4
+        + [
+            (types.RequestType.SAVE_WEIGHTS, "model_a", {}),
+            (types.RequestType.FORWARD_BACKWARD, "model_a", forward_backward_payload()),
+        ],
+    )
+    admitted, barriers = [], []
+    engine._admit_samples_continuous = lambda requests: admitted.extend(requests)
+    engine.process_single_requests = lambda requests: barriers.extend(requests)
+    try:
+        engine.process_pending_requests_once()
+        assert admitted == [str(rid) for rid in ids[:4]]
+        assert barriers == []
+        assert engine._training_jobs == {}
+        engine._complete_futures({str(rid): types.OptimStepOutput(metrics={}) for rid in ids[:4]})
+        engine.process_pending_requests_once()
+        assert barriers == [str(ids[4])]
+        assert engine._training_jobs == {}
+    finally:
+        engine._training_executor.shutdown(wait=True)

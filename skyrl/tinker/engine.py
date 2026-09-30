@@ -878,6 +878,10 @@ class TinkerEngine:
 
         result = self.backend.optim_step(model_id, request_data)
 
+        self._record_optimizer_profile_step(model_id)
+        return result
+
+    def _record_optimizer_profile_step(self, model_id: str) -> None:
         # One profiler step per optim_step, for the owning model only. Counters are
         # kept in memory and flushed by reconcile_profiler, so profiling adds no DB
         # write to this path.
@@ -889,8 +893,6 @@ class TinkerEngine:
                 # Never fail a client's optim_step because profiling misbehaved.
                 logger.warning(f"[profiler] step failed: {e}")
                 self._profiling_error = f"step failed: {e}"
-
-        return result
 
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
@@ -1065,9 +1067,7 @@ class TinkerEngine:
             processor: Function that processes requests and returns results dict
             name: Name for logging
             per_model: Process one model's requests at a time, completing each
-                model's futures as soon as its sub-batch finishes (GPU execution
-                is serialized per model anyway; this only changes completion
-                granularity, not batching within a model).
+                model's futures as soon as its sub-batch finishes.
             clear_request_data: Passed through to _complete_futures; see its docstring.
         """
         if not requests:
@@ -1118,6 +1118,155 @@ class TinkerEngine:
             self._sampler.submit(request_id, model_id, request_data)
         logger.debug(f"Admitted {len(valid_requests)} sample request(s); {self._sampler.inflight_count()} in flight")
 
+    def _process_independent_training_once(self) -> None:
+        """Run one FIFO queue per worker group, retaining a responsive scheduler.
+
+        Forward, backward, and optimizer requests may overlap across disjoint
+        groups. Sampling and lifecycle requests are global barriers. Only this
+        thread publishes results to the database. Pending in-flight rows remain
+        in the queue, so neither duplicate dispatch nor overtaking is possible.
+        """
+        if not hasattr(self, "_training_jobs"):
+            self._training_jobs = {}
+            self._failed_training_models = set()
+            self._completed_optimizer_models = []
+            self._training_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="training")
+        jobs = self._training_jobs
+        for key, (future, rid, model_id, kind) in list(jobs.items()):
+            if not future.done():
+                continue
+            try:
+                results = future.result()
+            except Exception as exc:
+                logger.exception(f"Independent training failed for {key}: {exc}")
+                results = {rid: types.ErrorResponse(error=str(exc), status="failed")}
+            if any(isinstance(result, types.ErrorResponse) for result in results.values()):
+                self._failed_training_models.add(model_id)
+            elif kind == types.RequestType.OPTIM_STEP:
+                self._completed_optimizer_models.append(model_id)
+            self._complete_futures(results, clear_request_data=True)
+            del jobs[key]
+        if not jobs:
+            for model_id in self._completed_optimizer_models:
+                self._record_optimizer_profile_step(model_id)
+            self._completed_optimizer_models.clear()
+            self.reconcile_profiler()
+            if (
+                self.config.session_cleanup_interval_sec >= 0
+                and self.config.session_timeout_sec >= 0
+                and time.time() - self._last_cleanup_time > self.config.session_cleanup_interval_sec
+            ):
+                self.cleanup_stale_sessions()
+                self._last_cleanup_time = time.time()
+
+        train_types = {
+            types.RequestType.FORWARD_BACKWARD,
+            types.RequestType.FORWARD,
+            types.RequestType.OPTIM_STEP,
+        }
+        with Session(self.db_engine) as session:
+            rows = session.exec(
+                select(FutureDB.request_id, FutureDB.model_id, FutureDB.request_type)
+                .where(FutureDB.status == RequestStatus.PENDING)
+                .where(FutureDB.request_type != types.RequestType.EXTERNAL)
+                .order_by(FutureDB.request_id)
+            ).all()
+            eligible = []
+            for row in rows:
+                if row[2] not in train_types:
+                    break
+                eligible.append(row)
+            barrier_rows = rows[:1]
+            if rows and rows[0][2] == types.RequestType.SAMPLE:
+                barrier_rows = []
+                for row in rows:
+                    if row[2] != types.RequestType.SAMPLE:
+                        break
+                    barrier_rows.append(row)
+            # Read large tensor payloads only for queue heads that can start.
+            ready = []
+            occupied = set(jobs)
+            for row in eligible:
+                key = self.backend.training_execution_key(row[1]) if self.backend.has_model(row[1]) else row[1]
+                if key not in occupied:
+                    occupied.add(key)
+                    ready.append(row)
+            requests = self._load_requests(session, ready if eligible else barrier_rows)
+            sample_candidates = (
+                self.find_batchable_sample(session)
+                if barrier_rows and barrier_rows[0][2] == types.RequestType.SAMPLE
+                else {}
+            )
+        if not requests:
+            return
+        if not eligible:
+            if jobs:
+                return
+            rid, model_id, kind, payload = requests[0]
+            if kind == types.RequestType.SAMPLE:
+                inflight = self._sampler.inflight_ids if self._sampler is not None else set()
+                request = {
+                    str(r): (m, types.SampleInput.model_validate(p))
+                    for r, m, _, p in requests
+                    if str(r) not in inflight and str(r) in sample_candidates
+                }
+                if self._continuous_sampling:
+                    self._admit_samples_continuous(request)
+                else:
+                    self.process_batch_requests(request, self.process_sample, "sample")
+            else:
+                if self._sampler is not None:
+                    self._sampler.drain(reason="training lifecycle barrier")
+                self.process_single_requests({str(rid): (model_id, kind, payload)})
+            return
+        if self._sampler is not None:
+            self._sampler.drain(reason="independent training")
+        selected = {}
+        for rid, model_id, kind, payload in requests:
+            if not self.backend.has_model(model_id):
+                self._complete_futures(
+                    {str(rid): _model_not_found_error(model_id)},
+                    clear_request_data=True,
+                )
+                continue
+            if model_id in self._failed_training_models:
+                self._complete_futures(
+                    {
+                        str(rid): types.ErrorResponse(
+                            error="An earlier training operation failed; recreate the model before continuing",
+                            status="failed",
+                        )
+                    },
+                    clear_request_data=True,
+                )
+                continue
+            key = self.backend.training_execution_key(model_id)
+            if key not in jobs:
+                selected.setdefault(key, (str(rid), model_id, kind, payload))
+        for key, (rid, model_id, kind, payload) in selected.items():
+
+            def execute(rid=rid, model_id=model_id, kind=kind, payload=payload, key=key):
+                started = time.monotonic()
+                logger.info(f"Concurrent {key} {kind.value} start")
+                try:
+                    if kind == types.RequestType.OPTIM_STEP:
+                        return {rid: self.backend.optim_step(model_id, types.OptimStepInput.model_validate(payload))}
+                    batch = {
+                        rid: (
+                            model_id,
+                            types.ForwardBackwardInput.model_validate(payload),
+                        )
+                    }
+                    return (
+                        self.process_forward_backward(batch)
+                        if kind == types.RequestType.FORWARD_BACKWARD
+                        else self.process_forward(batch)
+                    )
+                finally:
+                    logger.info(f"Concurrent {key} {kind.value} finished in {time.monotonic() - started:.3f}s")
+
+            jobs[key] = (self._training_executor.submit(execute), rid, model_id, kind)
+
     def process_pending_requests_once(self) -> None:
         """One scheduling iteration; see ``process_pending_requests``.
 
@@ -1133,6 +1282,10 @@ class TinkerEngine:
         deferred (left in the DB) and admitted on the next iteration instead
         of being processed as a convoy batch.
         """
+        if getattr(self.backend, "concurrent_model_batches", False) is True:
+            self._process_independent_training_once()
+            return
+
         # Converge torch profiling to the control row before picking up work,
         # so a session never starts or stops in the middle of a batch.
         self.reconcile_profiler()
@@ -1156,7 +1309,12 @@ class TinkerEngine:
             blocking_work = bool(forward_backward_requests or forward_requests or other_requests)
             if blocking_work:
                 first_blocking_id = min(
-                    int(rid) for rid in (*forward_backward_requests, *forward_requests, *other_requests)
+                    int(rid)
+                    for rid in (
+                        *forward_backward_requests,
+                        *forward_requests,
+                        *other_requests,
+                    )
                 )
                 earlier_samples = {rid: req for rid, req in sample_requests.items() if int(rid) < first_blocking_id}
                 if earlier_samples:
@@ -1191,7 +1349,11 @@ class TinkerEngine:
             clear_request_data=True,
         )
         self.process_batch_requests(
-            forward_requests, self.process_forward, "forward", per_model=True, clear_request_data=True
+            forward_requests,
+            self.process_forward,
+            "forward",
+            per_model=True,
+            clear_request_data=True,
         )
         self.process_batch_requests(sample_requests, self.process_sample, "sample")
 
@@ -1205,10 +1367,14 @@ class TinkerEngine:
 
     def process_pending_requests(self):
         """Main loop to process pending requests."""
-        while True:
-            self.process_pending_requests_once()
-            # Poll every 100ms
-            time.sleep(0.1)
+        try:
+            while True:
+                self.process_pending_requests_once()
+                time.sleep(0.1)
+        finally:
+            executor = getattr(self, "_training_executor", None)
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     def run(self):
         """Entry point to start the engine."""

@@ -96,3 +96,51 @@ def test_single_example_critic_unpadding_preserves_values_and_gradients(tmp_path
     torch.testing.assert_close(model.value_head.weight.grad, grad)
     with pytest.raises(ValueError, match="single-example"):
         model(ids.expand(2, -1), num_actions=3, attention_mask=torch.ones(2, 4))
+
+
+def test_concurrent_backward_never_parallelizes_same_role_adapters():
+    batches = [SimpleNamespace(all_model_ids=[i]) for i in ("a", "b")]
+    seen = []
+
+    def execute(batch):
+        seen.append(batch.all_model_ids[0])
+        return {batch.all_model_ids[0]: 1}
+
+    backend = SimpleNamespace(
+        concurrent_model_batches=True,
+        _sleep_inference_engines=Mock(),
+        _split_model_pass_batch_by_model_id=lambda _: batches,
+        _get_batch_role=lambda _: "policy",
+        _forward_backward_single_model_batch=execute,
+    )
+    SkyRLTrainBackend.forward_backward(backend, SimpleNamespace(all_model_inputs=[1]))
+    assert seen == ["a", "b"]
+
+
+def test_concurrent_training_rejects_shared_training_gpus():
+    with pytest.raises(ValueError, match="separate"):
+        FSDPBackendOverrides(concurrent_actor_critic=True)
+    with pytest.raises(ValueError, match="separate"):
+        FSDPBackendOverrides(
+            concurrent_actor_critic=True,
+            critic_with_inference=True,
+            **{"trainer.placement.colocate_all": True},
+        )
+    assert FSDPBackendOverrides(concurrent_actor_critic=True, critic_with_inference=True).concurrent_actor_critic
+
+
+def test_concurrent_capability_requires_initialized_disjoint_placement():
+    backend = SimpleNamespace(config=SimpleNamespace(concurrent_actor_critic=True), _cfg=None)
+    prop = SkyRLTrainBackend.concurrent_model_batches.fget
+    assert not prop(backend)
+    backend._cfg = SimpleNamespace(trainer=SimpleNamespace(placement=SimpleNamespace(colocate_all=True)))
+    assert not prop(backend)
+    backend._cfg.trainer.placement.colocate_all = False
+    assert prop(backend)
+
+
+def test_independent_training_disabled_for_unverified_worker_roles():
+    backend = SimpleNamespace(config=SimpleNamespace(concurrent_actor_critic=True),
+        _cfg=SimpleNamespace(trainer=SimpleNamespace(placement=SimpleNamespace(colocate_all=False))),
+        _model_ids_to_role={"actor": "policy", "critic": "critic", "reference": "ref"})
+    assert not SkyRLTrainBackend.concurrent_model_batches.fget(backend)
