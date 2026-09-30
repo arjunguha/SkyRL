@@ -1263,6 +1263,9 @@ class SkyRLTrainBackend(AbstractBackend):
                 loss_fn,
             )
         loss_fn_config = next((c for c in prepared_batch.all_loss_fn_configs if c is not None), None)
+        if role == "critic":
+            # Critic forward returns values and accepts no policy loss arguments.
+            loss_fn, loss_fn_config = None, None
         if role == "ref":
             # RefWorkerBase.forward(data) (worker.py) takes no loss_fn at all -- it
             # always runs the loss-free, logprobs-only inference path (matching

@@ -461,13 +461,14 @@ def _get_critic_model(
             setattr(self, self.base_model_prefix, base_llm_model(config))
 
             self.value_head_prefix = value_head_prefix
-            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, 1, bias=False))
+            setattr(self, value_head_prefix, nn.Linear(config.get_text_config().hidden_size, 1, bias=False))
 
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
+            self.fa4_unpad = config._attn_implementation == "fa4_sdpa"
             if remove_microbatch_padding:
                 assert (
-                    config._attn_implementation == "flash_attention_2"
+                    config._attn_implementation in {"flash_attention_2", "fa4_sdpa"}
                 ), "Flash attention must be used with remove_microbatch_padding"
 
             if self.sequence_parallel_size > 1:
@@ -488,7 +489,17 @@ def _get_critic_model(
             position_ids_fwd = position_ids
             attention_mask_fwd = attention_mask
 
-            if self.remove_microbatch_padding:
+            if self.fa4_unpad:
+                # This custom kernel has no padding-mask implementation. Never
+                # feed the request-wide left padding into attention. FA4's
+                # dense kernel cannot concatenate distinct examples either.
+                if input_ids.shape[0] != 1 or self.sequence_parallel_size != 1:
+                    raise ValueError("fa4_sdpa critic requires single-example microbatches and no sequence parallelism")
+                nnz_indices = attention_mask[0].bool().nonzero(as_tuple=True)[0]
+                input_ids_fwd = input_ids.index_select(1, nnz_indices)
+                position_ids_fwd = position_ids.index_select(1, nnz_indices)
+                attention_mask_fwd = None
+            elif self.remove_microbatch_padding:
                 from flash_attn.bert_padding import pad_input, unpad_input
 
                 with torch.no_grad():
@@ -534,7 +545,11 @@ def _get_critic_model(
 
             values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
 
-            if self.remove_microbatch_padding:
+            if self.fa4_unpad:
+                # Preserve response/value alignment expected by the worker,
+                # while autograd routes gradients only through real tokens.
+                values_BSH = values_BSH.new_zeros((*input_ids.shape, 1)).index_copy(1, nnz_indices, values_BSH)
+            elif self.remove_microbatch_padding:
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)
@@ -654,7 +669,10 @@ def get_llm_for_sequence_regression(
             lora_dropout=lora_dropout,
             bias="none",
         )
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(model, lora_config, autocast_adapter_dtype=not bf16)
+        # The value projection is part of the trained critic, not the frozen base.
+        # Critic checkpoints use the full FSDP state, including this projection.
+        getattr(model, value_head_prefix).requires_grad_(True)
 
         if load_in_4bit:
             for name, module in model.named_modules():
@@ -684,6 +702,6 @@ def get_llm_for_sequence_regression(
     # TODO: Find a better way to clarify reward model training.
     if init_value_head:
         value_head = getattr(model, value_head_prefix)
-        value_head.weight.data.normal_(mean=0.0, std=1 / (config.hidden_size + 1))
+        value_head.weight.data.normal_(mean=0.0, std=1 / (config.get_text_config().hidden_size + 1))
 
     return model

@@ -452,9 +452,14 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             target_modules=self.cfg.critic.model.lora.target_modules,
             exclude_modules=self.cfg.critic.model.lora.exclude_modules,
             value_head_prefix=self.cfg.algorithm.value_head_prefix,
-            init_value_head=self.cfg.policy.model.path == self.cfg.critic.model.path,
+            # A different-sized generative base also has no pretrained value head.
+            init_value_head="CriticModel" not in (model_config.architectures or []),
             sequence_parallel_size=self.cfg.critic.sequence_parallel_size,
-            remove_microbatch_padding=self.cfg.remove_microbatch_padding,
+            # FA4 uses single-example stripping; FA2 also supports packing.
+            remove_microbatch_padding=(
+                self.cfg.remove_microbatch_padding
+                and self.cfg.attn_implementation in {"flash_attention_2", "fa4_sdpa"}
+            ),
             model_config_kwargs=self.cfg.critic.model_config_kwargs,
             meta_init=use_meta,
         )
