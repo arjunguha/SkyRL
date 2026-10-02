@@ -51,6 +51,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
     BatchIterator,
+    TokenBasedBatchIterator,
     all_reduce_metrics,
     compute_minibatch_rollout_logprob_diff_metrics,
     get_microbatch_iterator,
@@ -960,7 +961,7 @@ class PolicyWorkerBase(Worker):
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
             if "loss_fn_outputs" in metrics:
-                all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
+                all_loss_fn_outputs.append(metrics.pop("loss_fn_outputs"))
 
             for k, v in metrics.items():
                 all_metrics[k].append(v)
@@ -980,6 +981,12 @@ class PolicyWorkerBase(Worker):
 
         dp_group = self.device_mesh.get_group("dp")
         result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
+
+        if all_loss_fn_outputs:
+            if isinstance(microbatch_iterator, TokenBasedBatchIterator):
+                all_loss_fn_outputs = microbatch_iterator.reorder_and_combine_items(all_loss_fn_outputs)
+            else:
+                all_loss_fn_outputs = [item for batch in all_loss_fn_outputs for item in batch]
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
 

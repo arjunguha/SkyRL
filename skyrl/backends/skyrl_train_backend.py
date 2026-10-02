@@ -369,8 +369,7 @@ class SkyRLTrainBackend(AbstractBackend):
             # case honored here regardless of the other.
             pg=policy_pg,
             num_gpus_per_actor=(
-                (not colocate_all and getattr(self.config, "policy_gpu_fraction", None))
-                or policy_num_gpus_per_actor
+                (not colocate_all and getattr(self.config, "policy_gpu_fraction", None)) or policy_num_gpus_per_actor
             ),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.policy.sequence_parallel_size,
@@ -420,9 +419,9 @@ class SkyRLTrainBackend(AbstractBackend):
         if colocate_all:
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
             num_critic_gpus = cfg.trainer.placement.critic_num_gpus_per_node * cfg.trainer.placement.critic_num_nodes
-            assert num_policy_gpus == num_critic_gpus, (
-                "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
-            )
+            assert (
+                num_policy_gpus == num_critic_gpus
+            ), "num_policy_gpus and num_critic_gpus must be the same when colocating policy and critic model"
 
         cfg.trainer.critic.model.lora.rank = lora_config.rank
         cfg.trainer.critic.model.lora.alpha = int(lora_config.alpha)
@@ -552,9 +551,9 @@ class SkyRLTrainBackend(AbstractBackend):
         client, server_setup = build_new_inference_client(
             self._cfg,
             self._tokenizer,
-            placement_group=self._colocate_pg
-            if (is_colocated or getattr(self.config, "critic_with_inference", False))
-            else None,
+            placement_group=(
+                self._colocate_pg if (is_colocated or getattr(self.config, "critic_with_inference", False)) else None
+            ),
         )
         self._inference_router = server_setup.router
         self._server_groups = server_setup.server_groups
@@ -1057,6 +1056,12 @@ class SkyRLTrainBackend(AbstractBackend):
             metrics["policy_lr:last"] = float(data["policy_lr"])
         if "critic_lr" in data:
             metrics["critic_lr:last"] = float(data["critic_lr"])
+
+        # Counts are per DP worker (including synchronization-only batches),
+        # summed when the SDK combines separately executed request chunks.
+        for key in ("num_microbatches", "num_padding_microbatches"):
+            if key in data:
+                metrics[f"{key}:sum"] = float(data[key])
 
         # Train-vs-rollout logprob gap, computed by the policy workers per
         # micro-batch (masked |logp_train - logp_rollout| over action tokens)
