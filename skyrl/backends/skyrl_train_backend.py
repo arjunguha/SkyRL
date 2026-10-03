@@ -1040,6 +1040,8 @@ class SkyRLTrainBackend(AbstractBackend):
 
         if "policy_loss" in data:
             metrics["pg_loss:sum"] = float(data["policy_loss"])
+        if "loss_metrics/clip_ratio" in data:
+            metrics["clip_ratio:mean"] = float(data["loss_metrics/clip_ratio"])
         if "policy_entropy" in data:
             metrics["entropy_loss:sum"] = float(data["policy_entropy"])
         if "policy_kl" in data:
