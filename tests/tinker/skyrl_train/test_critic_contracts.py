@@ -79,8 +79,8 @@ def test_single_example_critic_unpadding_preserves_values_and_gradients(tmp_path
         target_modules=["q_proj", "v_proj"],
         init_value_head=True,
     )
-    # Exercise the FA4 padding path with a CPU attention implementation.
-    model.get_base_model().fa4_unpad = True
+    # Exercise padding removal and restoration with CPU attention.
+    model.get_base_model().remove_microbatch_padding = True
     model.eval()
     ids = torch.tensor([[1, 2, 3, 4]])
     plain = model(ids, num_actions=3, attention_mask=torch.ones_like(ids))
@@ -94,8 +94,6 @@ def test_single_example_critic_unpadding_preserves_values_and_gradients(tmp_path
     assert torch.count_nonzero(values[:, :3]) == 0
     values.square().sum().backward()
     torch.testing.assert_close(model.value_head.weight.grad, grad)
-    with pytest.raises(ValueError, match="single-example"):
-        model(ids.expand(2, -1), num_actions=3, attention_mask=torch.ones(2, 4))
 
 
 def test_concurrent_backward_never_parallelizes_same_role_adapters():
