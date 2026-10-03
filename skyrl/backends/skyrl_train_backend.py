@@ -747,6 +747,10 @@ class SkyRLTrainBackend(AbstractBackend):
                 raise NotImplementedError("Critic model support is not implemented for the Megatron backend yet")
             else:
                 raise ValueError(f"Unknown strategy type: {self._cfg.trainer.strategy}")
+            if getattr(self.config, "critic_with_inference", False):
+                # vLLM profiles its memory budget before the shared-GPU critic
+                # is resident, rather than counting critic allocations against it.
+                self._ensure_inference_engines()
             self._build_critic(CriticWorker, lora_config)
         elif model_role == "ref":
             if model_role in self._model_ids_to_role.values():
