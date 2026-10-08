@@ -1227,6 +1227,22 @@ class SkyRLTrainBackend(AbstractBackend):
         prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         role = self._get_batch_role(prepared_batch.all_model_ids)
+        if len(prepared_batch.request_batch_slices) > 1:
+            # SDK chunks carry additive contributions to the caller's objective.
+            # Keep their configs and returned metrics separate: returning the
+            # coalesced loss to every request makes the SDK sum it repeatedly.
+            results = {}
+            for request_id, model_id, start, end in prepared_batch.request_batch_slices:
+                fields = {
+                    field: getattr(prepared_batch, field)[start:end]
+                    for field in types.PreparedModelPassBatch.model_fields
+                    if field != "request_batch_slices"
+                }
+                request_batch = types.PreparedModelPassBatch(
+                    **fields, request_batch_slices=[(request_id, model_id, 0, end - start)]
+                )
+                results.update(self._forward_backward_single_model_batch(request_batch))
+            return results
         self._release_shared_gpu_cache(role)
         loss_fn = prepared_batch.all_loss_fns[0]
         self._validate_batch_role_and_loss(role, loss_fn)
@@ -1258,11 +1274,26 @@ class SkyRLTrainBackend(AbstractBackend):
         # dispatch layer can swap to the right LoRA adapter before the op.
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
         if role == "critic":
+            # The SDK copies loss_fn_config unchanged to every request chunk.
+            # An explicit caller count makes both loss and gradients additive
+            # across those chunks. Without it, retain a per-request mean.
+            normalization_num_sequences = (loss_fn_config or {}).get(
+                "normalization_num_sequences", len(prepared_batch.all_model_inputs)
+            )
+            if (
+                not math.isfinite(normalization_num_sequences)
+                or normalization_num_sequences <= 0
+                or normalization_num_sequences != int(normalization_num_sequences)
+                or normalization_num_sequences < len(prepared_batch.all_model_inputs)
+            ):
+                raise ValueError("normalization_num_sequences must be an integer at least the request's sequence count")
             self._dispatch.set_algorithm_config(
                 "critic",
                 value_clip=(loss_fn_config or {}).get("value_clip", self._cfg.trainer.algorithm.value_clip),
             )
-            data = self._dispatch.forward_backward("critic", batch, model_id=model_id)
+            data = self._dispatch.forward_backward(
+                "critic", batch, model_id=model_id, normalization_num_sequences=normalization_num_sequences
+            )
         else:
             data = self._dispatch.forward_backward(
                 role,

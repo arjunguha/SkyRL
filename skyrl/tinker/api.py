@@ -705,7 +705,7 @@ class ForwardBackwardInput(BaseModel):
         "ppo": {"clip_low_threshold", "clip_high_threshold", "value_clip"},
         "gspo": {"clip_low_threshold", "clip_high_threshold"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
-        "ppo_critic": {"value_clip"},
+        "ppo_critic": {"value_clip", "normalization_num_sequences"},
         "dppo": {"delta_low", "delta_high"},
     }
 

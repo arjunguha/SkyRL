@@ -1527,7 +1527,9 @@ class CriticWorkerBase(Worker):
         self.critic_loss_fn: Callable = ppo_critic_loss
         self._micro_batches_accumulated = 0
 
-    def forward_backward(self, data: TrainingInputBatch) -> WorkerOutput:
+    def forward_backward(
+        self, data: TrainingInputBatch, normalization_num_sequences: Optional[float] = None
+    ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
 
@@ -1537,6 +1539,9 @@ class CriticWorkerBase(Worker):
 
         Args:
             data: TrainingInputBatch (already DP-sharded by WorkerDispatch/MeshDispatch)
+            normalization_num_sequences: Full caller batch size, before SDK request
+                chunking and DP padding. Each request contributes its sequence loss
+                sum divided by this count; gradients accumulate across requests.
 
         Returns:
             :class:`WorkerOutput` with empty ``loss_fn_outputs`` and scalar
@@ -1553,7 +1558,13 @@ class CriticWorkerBase(Worker):
         for microbatch in microbatch_iterator:
             experience = BaseBatchIterator.batch_to_experience(microbatch)
 
-            if use_token_batching:
+            if normalization_num_sequences is not None:
+                # FSDP averages gradients over DP ranks. Undo that averaging so
+                # zero-masked padding and arbitrary request/microbatch boundaries
+                # leave the full caller's per-sequence mean unchanged.
+                microbatch_weight = len(microbatch) * self.mesh_rank.dp_size / normalization_num_sequences
+                metrics = self._forward_backward_micro(experience, microbatch_weight=microbatch_weight)
+            elif use_token_batching:
                 # With token-based batching, microbatches may have different sizes.
                 # Scale loss by microbatch_weight so gradients are correctly weighted.
                 microbatch_weight = len(microbatch) / len(data)
@@ -1565,8 +1576,11 @@ class CriticWorkerBase(Worker):
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
-        # reduce metrics across micro batches
-        result = reduce_metrics(all_metrics)
+        # Pre-scaled critic losses already include each microbatch's share of
+        # the objective, so sum those contributions for reporting.
+        result = reduce_metrics(
+            all_metrics, sum_loss_metrics=use_token_batching or normalization_num_sequences is not None
+        )
 
         # all reduce metrics across DP workers
         result = all_reduce_metrics(result, self.strategy)
@@ -1639,8 +1653,8 @@ class CriticWorkerBase(Worker):
             The gradient norm (before scaling, after clipping)
         """
         # Scale accumulated gradients by 1/N to get correct average
-        # NOTE: When using token-based batching, loss is pre-scaled by microbatch_weight
-        # in forward_backward, so _micro_batches_accumulated stays 0 and no scaling needed.
+        # NOTE: With token batching or an explicit caller-batch denominator,
+        # forward_backward pre-scales each loss, so this counter stays zero.
         if self._micro_batches_accumulated > 0:
             scale = 1.0 / self._micro_batches_accumulated
             for param in self.model.parameters():
