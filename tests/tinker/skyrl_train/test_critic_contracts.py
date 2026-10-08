@@ -28,10 +28,12 @@ def test_value_head_is_trainable_with_lora_and_gets_a_gradient(tmp_path):
         "critic",
         bf16=False,
         lora_rank=2,
-        target_modules=["q_proj", "v_proj"],
+        target_modules="all-linear",
         init_value_head=True,
     )
+    assert isinstance(model.value_head, torch.nn.Linear)
     assert model.value_head.weight.requires_grad
+    assert not any("value_head.lora_" in name for name, _ in model.named_parameters())
     ids = torch.tensor([[1, 2, 3, 4]])
     values = model(ids, num_actions=3, attention_mask=torch.ones_like(ids))
     assert values.shape == (1, 3)

@@ -3,6 +3,7 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import re
 from typing import Optional, Union
 
 import numpy as np
@@ -646,6 +647,11 @@ def get_llm_for_sequence_regression(
     # LoRA
     if lora_rank > 0:
         model.enable_input_require_grads()
+        # Train the value head directly; adapters belong on the backbone.
+        if isinstance(exclude_modules, str):
+            exclude_modules = f"(?:{exclude_modules})|(?:.*\\.)?{re.escape(value_head_prefix)}"
+        else:
+            exclude_modules = [*(exclude_modules or []), value_head_prefix]
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
