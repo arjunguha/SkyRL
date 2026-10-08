@@ -50,7 +50,7 @@ class WorkerDispatch:
     def __init__(
         self,
         cfg: SkyRLTrainConfig,
-        policy_actor_group: PPORayActorGroup,
+        policy_actor_group: Optional[PPORayActorGroup] = None,
         critic_actor_group: Optional[PPORayActorGroup] = None,
         ref_actor_group: Optional[PPORayActorGroup] = None,
         inference_engine_client: "Optional[RemoteInferenceClient]" = None,
@@ -68,7 +68,9 @@ class WorkerDispatch:
 
         # Actor groups by name.
         # TODO: Remove these role-specific identifiers. We will move to using model IDs and add support for generic models beyond these.
-        self._actor_groups: Dict[str, PPORayActorGroup] = {"policy": policy_actor_group}
+        self._actor_groups: Dict[str, PPORayActorGroup] = {}
+        if policy_actor_group is not None:
+            self._actor_groups["policy"] = policy_actor_group
         if critic_actor_group is not None:
             self._actor_groups["critic"] = critic_actor_group
         if ref_actor_group is not None:
@@ -127,12 +129,7 @@ class WorkerDispatch:
         """Get LCM of all models' dp_size."""
         import math
 
-        dp_size = self._actor_groups["policy"].get_dp_size()
-        if "critic" in self._actor_groups:
-            dp_size = math.lcm(dp_size, self._actor_groups["critic"].get_dp_size())
-        if "ref" in self._actor_groups:
-            dp_size = math.lcm(dp_size, self._actor_groups["ref"].get_dp_size())
-        return dp_size
+        return math.lcm(*(group.get_dp_size() for group in self._actor_groups.values()))
 
     def dp_size(self, model: str) -> int:
         """Return the data-parallel size for ``model`` (e.g. "policy")."""

@@ -434,11 +434,13 @@ class SkyRLTrainBackend(AbstractBackend):
             num_gpus_per_actor=(
                 0.2
                 if colocate_all or getattr(self.config, "critic_with_inference", False)
-                else (getattr(self.config, "critic_gpu_fraction", None) or 1)
+                else ((getattr(self.config, "critic_gpu_fraction", None) or 1) if self._dispatch is not None else 1)
             ),
             colocate_all=colocate_all,
             sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
         )
+        if self._dispatch is None:
+            self._dispatch = WorkerDispatch(cfg=cfg)
         self._dispatch.register_actor_group("critic", critic_model)
         self._dispatch.init_model("critic", cfg.trainer.critic.model.path, num_training_steps=1e9)
         ray.get(critic_model.async_run_ray_method("pass_through", "_set_pad_token_id", self._tokenizer.pad_token_id))
@@ -737,8 +739,12 @@ class SkyRLTrainBackend(AbstractBackend):
         elif model_role == "critic":
             if model_role in self._model_ids_to_role.values():
                 raise ValueError(f"SkyRLTrainBackend already has a '{model_role}' model")
-            if "policy" not in self._model_ids_to_role.values():
-                raise ValueError("Create a policy model before creating a critic model")
+            if self._cfg is None:
+                self._cfg = _build_skyrl_train_config(self.base_model, self.config, lora_config)
+                if self._cfg.generator.inference_engine.num_engines != 0:
+                    raise ValueError("Critic-only creation requires a training-only backend")
+                if not ray.is_initialized():
+                    initialize_ray(self._cfg)
             if self._cfg.trainer.strategy == "fsdp":
                 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
                     CriticWorker,
