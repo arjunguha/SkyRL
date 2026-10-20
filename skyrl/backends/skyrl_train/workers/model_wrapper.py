@@ -115,6 +115,10 @@ class HFModelWrapper(nn.Module):
             from more_transformers import register_fa4_sdpa_attention
 
             register_fa4_sdpa_attention()
+        elif self.attn_implementation == "qwen3_5_fa4":
+            from more_transformers import register_qwen3_5_fa4_attention
+
+            register_qwen3_5_fa4_attention()
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
 
