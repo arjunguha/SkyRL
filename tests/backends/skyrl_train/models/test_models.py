@@ -9,9 +9,11 @@ from skyrl.backends.skyrl_train.workers.model_wrapper import (
 
 
 class _FakeModelConfig:
-    def __init__(self, *, dtype=None, torch_dtype=None):
+    def __init__(self, *, dtype=None, torch_dtype=None, text_config=None):
         self.dtype = dtype
         self.torch_dtype = torch_dtype
+        if text_config is not None:
+            self.text_config = text_config
 
 
 @pytest.mark.parametrize(
@@ -24,6 +26,9 @@ class _FakeModelConfig:
         (_FakeModelConfig(dtype="float16"), False, False),
         (_FakeModelConfig(dtype=None, torch_dtype=torch.bfloat16), False, True),
         (_FakeModelConfig(dtype=torch.float32), True, True),
+        (_FakeModelConfig(text_config=_FakeModelConfig(dtype="bfloat16")), False, True),
+        (_FakeModelConfig(text_config=_FakeModelConfig(dtype=torch.float32)), False, False),
+        (_FakeModelConfig(dtype=torch.float32, text_config=_FakeModelConfig(dtype="bfloat16")), False, False),
     ],
 )
 def test_should_load_in_bfloat16(config, force_bfloat16: bool, expected: bool) -> None:

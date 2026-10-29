@@ -48,6 +48,10 @@ def should_load_in_bfloat16(model_config, *, force_bfloat16: bool = False) -> bo
     native_dtype = getattr(model_config, "dtype", None)
     if native_dtype is None:
         native_dtype = getattr(model_config, "torch_dtype", None)
+    # Multimodal configs (e.g. Qwen3.5) record the dtype only on text_config.
+    text_config = getattr(model_config, "text_config", None)
+    if native_dtype is None and text_config is not None:
+        native_dtype = getattr(text_config, "dtype", None) or getattr(text_config, "torch_dtype", None)
     if isinstance(native_dtype, str):
         native_dtype = native_dtype.removeprefix("torch.").lower()
         return native_dtype in {"bf16", "bfloat16"}
