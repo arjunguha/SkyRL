@@ -275,10 +275,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             # Keep PEFT's wrapper outermost; the inference namespace belongs inside it.
             peft_wrapper_prefix = "base_model.model."
             # Preserve unfamiliar naming formats rather than inventing a wrapper for them.
+            # Gemma 4 keeps its text model under model.language_model even when loaded
+            # language-only; prefixing those names again doubles the path, and vLLM
+            # then matches no module and silently samples from the base model.
+            already_nested = (weight_prefix, f"model.{weight_prefix}")
             lora_params = {
                 (
                     f"{peft_wrapper_prefix}{weight_prefix}{name.removeprefix(peft_wrapper_prefix)}"
                     if name.startswith(peft_wrapper_prefix)
+                    and not name.removeprefix(peft_wrapper_prefix).startswith(already_nested)
                     else name
                 ): tensor
                 for name, tensor in lora_params.items()
